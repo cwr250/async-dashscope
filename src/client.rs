@@ -320,7 +320,7 @@ where
         while let Some(ev) = event_source.next().await {
             match ev {
                 Err(e) => {
-                    Err(DashScopeError::StreamError(e.to_string()))?;
+                    Err(DashScopeError::StreamError(e))?;
                 }
                 Ok(Event::Open) => continue,
                 Ok(Event::Message(message)) => {

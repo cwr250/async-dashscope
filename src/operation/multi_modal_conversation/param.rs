@@ -11,6 +11,7 @@ pub struct MultiModalConversationParam {
     pub model: String,
     pub input: Input,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(setter(into, strip_option))]
     #[builder(default=None)]
     pub stream: Option<bool>,

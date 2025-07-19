@@ -6,9 +6,11 @@ use serde_json::Value;
 
 #[derive(Debug, Clone, Builder, Serialize, Deserialize, PartialEq)]
 pub struct Parameters {
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(setter(into, strip_option))]
     #[builder(default=None)]
     pub result_format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(setter(strip_option))]
     #[builder(default=None)]
     pub translation_options: Option<TranslationOptions>,
@@ -17,40 +19,48 @@ pub struct Parameters {
         since = "0.5.0",
         note = "Stream control is now unified under the top-level `stream` parameter in request objects. This parameter will be ignored."
     )]
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(setter(into, strip_option))]
     #[builder(default=None)]
     pub incremental_output: Option<bool>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(setter(into, strip_option))]
     #[builder(default=None)]
     // function call
     pub tools: Option<Vec<FunctionCall>>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(setter(into, strip_option))]
     #[builder(default=None)]
     pub parallel_tool_calls: Option<bool>,
 
     // 限制思考长度
     // 该参数仅支持Qwen3 模型设定。
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(setter(into, strip_option))]
     #[builder(default=None)]
     pub thinking_budget: Option<usize>,
 
     // 联网搜索
     // 仅 Qwen3 商业版模型、QwQ 商业版模型（除了qwq-plus-2025-03-05）支持联网搜索。
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(setter(into, strip_option))]
     #[builder(default=None)]
     pub enable_search: Option<bool>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(setter(into, strip_option))]
     #[builder(default=None)]
     pub search_options: Option<SearchOptions>,
 
     // 只支持 qwen3, 对 QwQ 与 DeepSeek-R1 模型无效。
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(setter(into, strip_option))]
     #[builder(default=None)]
     pub enable_thinking: Option<bool>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(setter(into, strip_option))]
     #[builder(default=None)]
     pub response_format: Option<ResponseFormat>,
@@ -74,10 +84,12 @@ impl ParametersBuilder {
 
 #[derive(Debug, Clone, Builder, Serialize, Deserialize, PartialEq)]
 pub struct FunctionCall {
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(setter(into, strip_option))]
     #[serde(rename = "type")]
     pub typ: Option<String>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(setter(into, strip_option))]
     #[serde(rename = "function")]
     pub function: Option<Function>,
@@ -87,9 +99,11 @@ pub struct FunctionCall {
 #[builder(setter(into, strip_option))]
 pub struct Function {
     name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(setter(into, strip_option))]
     #[builder(default=None)]
     description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(setter(into, strip_option))]
     #[builder(default=None)]
     parameters: Option<FunctionParameters>,
@@ -100,20 +114,26 @@ pub struct FunctionParameters {
     #[serde(rename = "type")]
     pub typ: String,
     properties: HashMap<String, Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     required: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Builder, Serialize, Deserialize, PartialEq)]
 #[builder(setter(into, strip_option))]
 pub struct SearchOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default=None)]
     pub forced_search: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default=None)]
     pub enable_source: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default=None)]
     pub enable_citation: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default=None)]
     pub citation_format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default=None)]
     pub search_strategy: Option<String>,
 }
@@ -129,6 +149,7 @@ pub struct TranslationOptions {
     pub source_lang: String,
     #[builder(setter(into))]
     pub target_lang: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(setter(into, strip_option))]
     #[builder(default=None)]
     pub terms: Option<Vec<Term>>,
