@@ -8,6 +8,7 @@
 use derive_builder::Builder;
 use reqwest::header::AUTHORIZATION;
 use secrecy::{ExposeSecret as _, SecretString};
+use url::Url;
 
 pub const DASHSCOPE_API_BASE: &str = "https://dashscope.aliyuncs.com/api/v1";
 
@@ -39,27 +40,58 @@ impl ConfigBuilder {
 
 impl Config {
     pub fn url(&self, path: &str) -> String {
-        let n_url = format!(
-            "{}/{}",
-            self.api_base.clone()
-                .unwrap_or(DASHSCOPE_API_BASE.to_string())
-                .trim_end_matches('/'),
-            path.trim_start_matches('/')
-        );
-        n_url.trim_end_matches('/').to_string()
+        let base = self
+            .api_base
+            .clone()
+            .unwrap_or(DASHSCOPE_API_BASE.to_string());
+
+        // Validate that base URL is properly formed
+        let base_url = Url::parse(&base).expect("base URL should be valid");
+
+        // Handle empty path case
+        if path.is_empty() {
+            return base_url.to_string().trim_end_matches('/').to_string();
+        }
+
+        // For proper relative URL resolution, ensure base ends with '/' for joining
+        let base_str = if base_url.path().ends_with('/') {
+            base_url.to_string()
+        } else {
+            format!("{}/", base_url.to_string())
+        };
+
+        let base_with_slash =
+            Url::parse(&base_str).expect("base URL with trailing slash should be valid");
+
+        // Clean the path and join using url crate for robust handling
+        let clean_path = path.trim_start_matches('/');
+
+        let joined_url = base_with_slash
+            .join(clean_path)
+            .expect("path should be valid for URL joining");
+
+        // Trim trailing slash to match original behavior
+        joined_url.to_string().trim_end_matches('/').to_string()
     }
     pub fn headers(&self) -> reqwest::header::HeaderMap {
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("Content-Type", "application/json".parse().unwrap());
+        headers.insert(
+            "Content-Type",
+            "application/json"
+                .parse()
+                .expect("static header value 'application/json' should parse successfully"),
+        );
         headers.insert(
             "X-DashScope-OssResourceResolve",
-            "enable".parse().unwrap(),
+            "enable"
+                .parse()
+                .expect("static header value 'enable' should parse successfully"),
         );
         headers.insert(
             AUTHORIZATION,
             format!("Bearer {}", self.api_key.expose_secret())
                 .parse()
-                .unwrap(),
+                .expect("authorization header should parse successfully"),
         );
         headers
     }
@@ -67,7 +99,7 @@ impl Config {
     pub fn set_api_key(&mut self, api_key: SecretString) {
         self.api_key = api_key;
     }
-    
+
     pub fn api_key(&self) -> &SecretString {
         &self.api_key
     }

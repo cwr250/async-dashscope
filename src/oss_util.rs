@@ -37,9 +37,16 @@ pub(crate) async fn get_upload_policy(
     let mut headers = HeaderMap::new();
     headers.insert(
         "Authorization",
-        format!("Bearer {api_key}").parse().unwrap(),
+        format!("Bearer {api_key}")
+            .parse()
+            .expect("authorization header should parse successfully"),
     );
-    headers.insert("Content-Type", "application/json".parse().unwrap());
+    headers.insert(
+        "Content-Type",
+        "application/json"
+            .parse()
+            .expect("static header value 'application/json' should parse successfully"),
+    );
     let params = json!({
         "action": "getPolicy",
         "model": model_name
@@ -60,9 +67,8 @@ pub(crate) async fn get_upload_policy(
 pub(crate) async fn upload_file_to_oss(
     policy_data: PolicyData,
     mut file: File,
-    file_name:&str,
+    file_name: &str,
 ) -> Result<String, crate::error::DashScopeError> {
-    
     let key = format!("{}/{}", policy_data.upload_dir, file_name);
 
     let mut buffer = Vec::new();
@@ -115,7 +121,6 @@ pub(crate) async fn upload_file_and_get_url(
             crate::error::DashScopeError::UploadError("file name is empty".to_string())
         })?;
 
-
     let file = tokio::fs::OpenOptions::new()
         .read(true)
         .open(file_path)
@@ -134,7 +139,7 @@ pub(crate) async fn upload_file_and_get_url(
 
     let policy_data = get_upload_policy(api_key, model_name).await?;
 
-    let url = upload_file_to_oss(policy_data.data, file,file_name).await?;
+    let url = upload_file_to_oss(policy_data.data, file, file_name).await?;
 
     Ok(url)
 }
@@ -144,9 +149,6 @@ pub(crate) fn is_valid_url(s: &str) -> bool {
     Url::parse(s).is_ok()
 }
 
-
-
-
 #[cfg(test)]
 mod test {
     use super::*;
@@ -154,7 +156,8 @@ mod test {
     #[tokio::test]
     async fn test_get_upload_policy() -> Result<(), Box<dyn std::error::Error>> {
         dotenvy::dotenv()?;
-        let api_key = std::env::var("DASHSCOPE_API_KEY").unwrap();
+        let api_key = std::env::var("DASHSCOPE_API_KEY")
+            .expect("DASHSCOPE_API_KEY environment variable should be set for tests");
         let model_name = "qwen-vl-max";
         let result = get_upload_policy(&api_key, model_name).await;
         assert!(result.is_ok());
