@@ -1,7 +1,10 @@
 use std::fmt::Display;
 
+use bytes::Bytes;
 use reqwest_eventsource::CannotCloneRequestError;
 use serde::Deserialize;
+
+use crate::config::ConfigError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DashScopeError {
@@ -14,7 +17,7 @@ pub enum DashScopeError {
     #[error("failed to deserialize api response: {source}. Raw response: {}", String::from_utf8_lossy(&raw_response).chars().take(200).collect::<String>())]
     JSONDeserialize {
         source: serde_json::Error,
-        raw_response: Vec<u8>,
+        raw_response: Bytes,
     },
     #[error("{0}")]
     ElementError(String),
@@ -29,6 +32,9 @@ pub enum DashScopeError {
 
     #[error("upload error: {0}")]
     UploadError(String),
+
+    #[error("configuration error: {0}")]
+    ConfigError(#[from] ConfigError),
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -58,14 +64,14 @@ impl From<crate::operation::common::ParametersBuilderError> for DashScopeError {
     }
 }
 
-pub(crate) fn map_deserialization_error(e: serde_json::Error, bytes: &[u8]) -> DashScopeError {
+pub(crate) fn map_deserialization_error(e: serde_json::Error, bytes: Bytes) -> DashScopeError {
     tracing::error!(
         "failed deserialization of: {}",
-        String::from_utf8_lossy(bytes)
+        String::from_utf8_lossy(&bytes)
     );
     DashScopeError::JSONDeserialize {
         source: e,
-        raw_response: bytes.to_vec(),
+        raw_response: bytes,
     }
 }
 

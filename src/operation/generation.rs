@@ -62,6 +62,7 @@ impl<'a> Generation<'a> {
     ///
     /// # 注意
     /// 该函数自动将 `request` 的 `stream` 属性设置为 `Some(true)`，确保总是以流式处理方式执行生成任务。
+    #[must_use]
     pub async fn call_stream(
         &self,
         mut request: GenerationParam,

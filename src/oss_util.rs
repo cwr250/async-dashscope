@@ -144,9 +144,11 @@ pub(crate) async fn upload_file_and_get_url(
     Ok(url)
 }
 
-/// 检查字符串是否为有效的URL
+/// 检查字符串是否为有效的URL (仅支持 http 和 https 协议)
 pub(crate) fn is_valid_url(s: &str) -> bool {
-    Url::parse(s).is_ok()
+    Url::parse(s)
+        .map(|u| ["http", "https"].contains(&u.scheme()))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -163,5 +165,115 @@ mod test {
         assert!(result.is_ok());
 
         Ok(())
+    }
+
+    #[test]
+    fn test_is_valid_url_accepts_http_and_https() {
+        // Test valid HTTP URLs
+        assert!(is_valid_url("http://example.com"));
+        assert!(is_valid_url("http://example.com/path"));
+        assert!(is_valid_url("http://example.com:8080/path?query=value"));
+
+        // Test valid HTTPS URLs
+        assert!(is_valid_url("https://example.com"));
+        assert!(is_valid_url("https://example.com/path"));
+        assert!(is_valid_url("https://example.com:443/path?query=value"));
+        assert!(is_valid_url("https://subdomain.example.com/path"));
+    }
+
+    #[test]
+    fn test_is_valid_url_rejects_other_protocols() {
+        // Test invalid protocols
+        assert!(!is_valid_url("ftp://example.com/file.txt"));
+        assert!(!is_valid_url("mailto:user@example.com"));
+        assert!(!is_valid_url("file:///path/to/file"));
+        assert!(!is_valid_url("data:text/plain;base64,SGVsbG8="));
+        assert!(!is_valid_url("javascript:alert('xss')"));
+        assert!(!is_valid_url("tel:+1234567890"));
+        assert!(!is_valid_url("ssh://user@host.com"));
+    }
+
+    #[test]
+    fn test_is_valid_url_rejects_invalid_urls() {
+        // Test completely invalid URLs
+        assert!(!is_valid_url("not-a-url"));
+        assert!(!is_valid_url(""));
+        assert!(!is_valid_url("://missing-scheme"));
+        assert!(!is_valid_url("http://"));
+        assert!(!is_valid_url("https://"));
+        assert!(!is_valid_url("just some text"));
+        assert!(!is_valid_url("example.com")); // Missing protocol
+    }
+
+    #[test]
+    fn test_is_valid_url_edge_cases() {
+        // Test edge cases
+        assert!(!is_valid_url("HTTP://EXAMPLE.COM")); // Uppercase scheme not handled by url crate
+        assert!(is_valid_url("https://192.168.1.1")); // IP address
+        assert!(is_valid_url("http://localhost:3000")); // Localhost
+        assert!(is_valid_url("https://example.com/")); // Trailing slash
+    }
+}
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_get_upload_policy() -> Result<(), Box<dyn std::error::Error>> {
+        dotenvy::dotenv()?;
+        let api_key = std::env::var("DASHSCOPE_API_KEY")
+            .expect("DASHSCOPE_API_KEY environment variable should be set for tests");
+        let model_name = "qwen-vl-max";
+        let result = get_upload_policy(&api_key, model_name).await;
+        assert!(result.is_ok());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_is_valid_url_accepts_http_and_https() {
+        // Test valid HTTP URLs
+        assert!(is_valid_url("http://example.com"));
+        assert!(is_valid_url("http://example.com/path"));
+        assert!(is_valid_url("http://example.com:8080/path?query=value"));
+
+        // Test valid HTTPS URLs
+        assert!(is_valid_url("https://example.com"));
+        assert!(is_valid_url("https://example.com/path"));
+        assert!(is_valid_url("https://example.com:443/path?query=value"));
+        assert!(is_valid_url("https://subdomain.example.com/path"));
+    }
+
+    #[test]
+    fn test_is_valid_url_rejects_other_protocols() {
+        // Test invalid protocols
+        assert!(!is_valid_url("ftp://example.com/file.txt"));
+        assert!(!is_valid_url("mailto:user@example.com"));
+        assert!(!is_valid_url("file:///path/to/file"));
+        assert!(!is_valid_url("data:text/plain;base64,SGVsbG8="));
+        assert!(!is_valid_url("javascript:alert('xss')"));
+        assert!(!is_valid_url("tel:+1234567890"));
+        assert!(!is_valid_url("ssh://user@host.com"));
+    }
+
+    #[test]
+    fn test_is_valid_url_rejects_invalid_urls() {
+        // Test completely invalid URLs
+        assert!(!is_valid_url("not-a-url"));
+        assert!(!is_valid_url(""));
+        assert!(!is_valid_url("://missing-scheme"));
+        assert!(!is_valid_url("http://"));
+        assert!(!is_valid_url("https://"));
+        assert!(!is_valid_url("just some text"));
+        assert!(!is_valid_url("example.com")); // Missing protocol
+    }
+
+    #[test]
+    fn test_is_valid_url_edge_cases() {
+        // Test edge cases
+        assert!(!is_valid_url("HTTP://EXAMPLE.COM")); // Uppercase scheme not handled by url crate
+        assert!(is_valid_url("https://192.168.1.1")); // IP address
+        assert!(is_valid_url("http://localhost:3000")); // Localhost
+        assert!(is_valid_url("https://example.com/")); // Trailing slash
     }
 }

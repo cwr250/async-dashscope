@@ -89,34 +89,33 @@ impl TryFrom<Value> for Element {
     type Error = crate::error::DashScopeError;
 
     fn try_from(value: Value) -> Result<Self, Self::Error> {
-        // image: {"image": "https://example.com/image.png"}
-        // video: {"video": "https://example.com/video.mp4"}
-        // audio: {"audio": "https://example.com/audio.mp3"}
-        // text: {"text": "Hello, world!"}
-        if let Some(image) = value.get("image") {
-            if let Some(s) = image.as_str() {
-                return Ok(Element::Image(s.to_string()));
-            }
+        // Ensure the value is an object with exactly one key
+        let obj = value.as_object().ok_or_else(|| {
+            crate::error::DashScopeError::ElementError("Element must be a JSON object".into())
+        })?;
+
+        if obj.len() != 1 {
+            return Err(crate::error::DashScopeError::ElementError(
+                "Element must be a single-key object".into(),
+            ));
         }
-        if let Some(video) = value.get("video") {
-            if let Some(s) = video.as_str() {
-                return Ok(Element::Video(s.to_string()));
-            }
+
+        // Get the single key-value pair
+        let (key, val) = obj.iter().next().unwrap();
+        let s = val.as_str().ok_or_else(|| {
+            crate::error::DashScopeError::ElementError("Element value must be a string".into())
+        })?;
+
+        match key.as_str() {
+            "image" => Ok(Element::Image(s.to_string())),
+            "video" => Ok(Element::Video(s.to_string())),
+            "audio" => Ok(Element::Audio(s.to_string())),
+            "text" => Ok(Element::Text(s.to_string())),
+            _ => Err(crate::error::DashScopeError::ElementError(format!(
+                "Unknown element type: {}",
+                key
+            ))),
         }
-        if let Some(audio) = value.get("audio") {
-            if let Some(s) = audio.as_str() {
-                return Ok(Element::Audio(s.to_string()));
-            }
-        }
-        if let Some(text) = value.get("text") {
-            if let Some(s) = text.as_str() {
-                // 处理文本字段
-                return Ok(Element::Text(s.to_string()));
-            }
-        }
-        Err(crate::error::DashScopeError::ElementError(
-            "Invalid element type.".into(),
-        ))
     }
 }
 
@@ -133,6 +132,112 @@ impl Message {
 
     pub fn push_content(&mut self, content: Element) {
         self.contents.push(content);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_element_try_from_valid_single_key() {
+        // Test valid image element
+        let image_json = json!({"image": "https://example.com/image.jpg"});
+        let element = Element::try_from(image_json).unwrap();
+        match element {
+            Element::Image(url) => assert_eq!(url, "https://example.com/image.jpg"),
+            _ => panic!("Expected Image element"),
+        }
+
+        // Test valid text element
+        let text_json = json!({"text": "Hello world"});
+        let element = Element::try_from(text_json).unwrap();
+        match element {
+            Element::Text(text) => assert_eq!(text, "Hello world"),
+            _ => panic!("Expected Text element"),
+        }
+
+        // Test valid video element
+        let video_json = json!({"video": "https://example.com/video.mp4"});
+        let element = Element::try_from(video_json).unwrap();
+        match element {
+            Element::Video(url) => assert_eq!(url, "https://example.com/video.mp4"),
+            _ => panic!("Expected Video element"),
+        }
+
+        // Test valid audio element
+        let audio_json = json!({"audio": "https://example.com/audio.mp3"});
+        let element = Element::try_from(audio_json).unwrap();
+        match element {
+            Element::Audio(url) => assert_eq!(url, "https://example.com/audio.mp3"),
+            _ => panic!("Expected Audio element"),
+        }
+    }
+
+    #[test]
+    fn test_element_try_from_rejects_multiple_keys() {
+        let multi_key_json = json!({
+            "image": "https://example.com/image.jpg",
+            "text": "Some text"
+        });
+
+        let result = Element::try_from(multi_key_json);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("single-key object"));
+    }
+
+    #[test]
+    fn test_element_try_from_rejects_empty_object() {
+        let empty_json = json!({});
+
+        let result = Element::try_from(empty_json);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("single-key object"));
+    }
+
+    #[test]
+    fn test_element_try_from_rejects_non_object() {
+        let array_json = json!(["image", "https://example.com/image.jpg"]);
+
+        let result = Element::try_from(array_json);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("must be a JSON object"));
+
+        let string_json = json!("just a string");
+        let result = Element::try_from(string_json);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("must be a JSON object"));
+    }
+
+    #[test]
+    fn test_element_try_from_rejects_non_string_values() {
+        let number_value_json = json!({"image": 123});
+
+        let result = Element::try_from(number_value_json);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("must be a string"));
+
+        let object_value_json = json!({"text": {"content": "hello"}});
+        let result = Element::try_from(object_value_json);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("must be a string"));
+    }
+
+    #[test]
+    fn test_element_try_from_rejects_unknown_type() {
+        let unknown_type_json = json!({"document": "https://example.com/doc.pdf"});
+
+        let result = Element::try_from(unknown_type_json);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("Unknown element type: document"));
     }
 }
 

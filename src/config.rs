@@ -10,6 +10,16 @@ use reqwest::header::{AUTHORIZATION, USER_AGENT};
 use secrecy::{ExposeSecret as _, SecretString};
 use url::Url;
 
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("Invalid base URL: {0}")]
+    InvalidBaseUrl(#[from] url::ParseError),
+    #[error("Invalid path: {0}")]
+    InvalidPath(String),
+    #[error("Missing API key")]
+    MissingApiKey,
+}
+
 pub const DASHSCOPE_API_BASE: &str = "https://dashscope.aliyuncs.com/api/v1";
 pub const USER_AGENT_VALUE: &str = concat!("async-dashscope/", env!("CARGO_PKG_VERSION"));
 
@@ -26,55 +36,55 @@ pub const USER_AGENT_VALUE: &str = concat!("async-dashscope/", env!("CARGO_PKG_V
 /// ```
 #[derive(Debug, Builder, Clone)]
 #[builder(setter(into))]
+#[builder(build_fn(skip))]
 pub struct Config {
     #[builder(setter(into, strip_option))]
     #[builder(default = "self.default_base_url()")]
     api_base: Option<String>,
     api_key: SecretString,
+    headers: reqwest::header::HeaderMap,
 }
 
 impl ConfigBuilder {
     fn default_base_url(&self) -> Option<String> {
         Some(DASHSCOPE_API_BASE.to_string())
     }
-}
 
-impl Config {
-    pub fn url(&self, path: &str) -> String {
-        let base = self
-            .api_base
-            .clone()
-            .unwrap_or(DASHSCOPE_API_BASE.to_string());
+    pub fn build(&self) -> Result<Config, ConfigBuilderError> {
+        let api_key = self.api_key.clone().ok_or_else(|| {
+            ConfigBuilderError::ValidationError("api_key is required".to_string())
+        })?;
 
-        // Validate that base URL is properly formed
-        let base_url = Url::parse(&base).expect("base URL should be valid");
-
-        // Handle empty path case
-        if path.is_empty() {
-            return base_url.to_string().trim_end_matches('/').to_string();
+        // Validate that API key is not empty
+        if api_key.expose_secret().is_empty() {
+            return Err(ConfigBuilderError::ValidationError(
+                "api_key cannot be empty".to_string(),
+            ));
         }
 
-        // For proper relative URL resolution, ensure base ends with '/' for joining
-        let base_str = if base_url.path().ends_with('/') {
-            base_url.to_string()
-        } else {
-            format!("{}/", base_url.to_string())
-        };
+        let api_base = self
+            .api_base
+            .clone()
+            .unwrap_or_else(|| self.default_base_url());
 
-        let base_with_slash =
-            Url::parse(&base_str).expect("base URL with trailing slash should be valid");
+        // Validate base URL if provided
+        if let Some(ref base) = api_base {
+            Url::parse(base).map_err(|e| {
+                ConfigBuilderError::ValidationError(format!("Invalid base URL: {}", e))
+            })?;
+        }
 
-        // Clean the path and join using url crate for robust handling
-        let clean_path = path.trim_start_matches('/');
+        // Build headers once during construction
+        let headers = Self::build_headers(&api_key);
 
-        let joined_url = base_with_slash
-            .join(clean_path)
-            .expect("path should be valid for URL joining");
-
-        // Trim trailing slash to match original behavior
-        joined_url.to_string().trim_end_matches('/').to_string()
+        Ok(Config {
+            api_base,
+            api_key,
+            headers,
+        })
     }
-    pub fn headers(&self) -> reqwest::header::HeaderMap {
+
+    fn build_headers(api_key: &SecretString) -> reqwest::header::HeaderMap {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             "Content-Type",
@@ -90,7 +100,7 @@ impl Config {
         );
         headers.insert(
             AUTHORIZATION,
-            format!("Bearer {}", self.api_key.expose_secret())
+            format!("Bearer {}", api_key.expose_secret())
                 .parse()
                 .expect("authorization header should parse successfully"),
         );
@@ -102,9 +112,47 @@ impl Config {
         );
         headers
     }
+}
+
+impl Config {
+    pub fn url(&self, path: &str) -> Result<String, ConfigError> {
+        let base = self.api_base.as_deref().unwrap_or(DASHSCOPE_API_BASE);
+
+        // Validate that base URL is properly formed
+        let base_url = Url::parse(base)?;
+
+        // Handle empty path case
+        if path.is_empty() {
+            return Ok(base_url.to_string().trim_end_matches('/').to_string());
+        }
+
+        // For proper relative URL resolution, ensure base ends with '/' for joining
+        let base_str = if base_url.path().ends_with('/') {
+            base_url.to_string()
+        } else {
+            format!("{}/", base_url.to_string())
+        };
+
+        let base_with_slash = Url::parse(&base_str)?;
+
+        // Clean the path and join using url crate for robust handling
+        let clean_path = path.trim_start_matches('/');
+
+        let joined_url = base_with_slash.join(clean_path).map_err(|e| {
+            ConfigError::InvalidPath(format!("Failed to join path '{}': {}", path, e))
+        })?;
+
+        // Trim trailing slash to match original behavior
+        Ok(joined_url.to_string().trim_end_matches('/').to_string())
+    }
+    pub fn headers(&self) -> &reqwest::header::HeaderMap {
+        &self.headers
+    }
 
     pub fn set_api_key(&mut self, api_key: SecretString) {
-        self.api_key = api_key;
+        self.api_key = api_key.clone();
+        // Rebuild headers when API key changes
+        self.headers = ConfigBuilder::build_headers(&api_key);
     }
 
     pub fn api_key(&self) -> &SecretString {
@@ -114,11 +162,15 @@ impl Config {
 
 impl Default for Config {
     fn default() -> Self {
+        let api_key: SecretString = std::env::var("DASHSCOPE_API_KEY")
+            .unwrap_or_else(|_| "".to_string())
+            .into();
+        let headers = ConfigBuilder::build_headers(&api_key);
+
         Self {
             api_base: Some(DASHSCOPE_API_BASE.to_string()),
-            api_key: std::env::var("DASHSCOPE_API_KEY")
-                .unwrap_or_else(|_| "".to_string())
-                .into(),
+            api_key,
+            headers,
         }
     }
 }
@@ -134,7 +186,7 @@ mod tests {
             .api_key("test")
             .build()
             .unwrap();
-        assert_eq!(instance.url("/v1"), "https://example.com/v1");
+        assert_eq!(instance.url("/v1").unwrap(), "https://example.com/v1");
     }
 
     #[test]
@@ -144,14 +196,14 @@ mod tests {
             .api_key("test")
             .build()
             .unwrap();
-        assert_eq!(instance.url(""), "http://localhost:8080");
+        assert_eq!(instance.url("").unwrap(), "http://localhost:8080");
     }
 
     #[test]
     fn test_url_empty_api_base() {
         let instance = ConfigBuilder::default().api_key("test").build().unwrap();
         assert_eq!(
-            instance.url("/test"),
+            instance.url("/test").unwrap(),
             format!("{DASHSCOPE_API_BASE}/test").as_str()
         );
     }
@@ -163,7 +215,7 @@ mod tests {
             .api_key("test")
             .build()
             .unwrap(); //Config {
-        assert_eq!(instance.url("/b"), "https://a.com/b");
+        assert_eq!(instance.url("/b").unwrap(), "https://a.com/b");
     }
 
     #[test]
@@ -173,7 +225,7 @@ mod tests {
             .api_key("test")
             .build()
             .unwrap();
-        assert_eq!(instance.url("b"), "https://a.com/b");
+        assert_eq!(instance.url("b").unwrap(), "https://a.com/b");
     }
 
     #[test]
@@ -187,5 +239,75 @@ mod tests {
             instance.headers().get("Authorization").unwrap(),
             "Bearer test"
         );
+    }
+
+    #[test]
+    fn test_empty_api_key_validation() {
+        let result = ConfigBuilder::default()
+            .api_base("https://example.com")
+            .api_key("")
+            .build();
+
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("api_key cannot be empty"));
+    }
+
+    #[test]
+    fn test_missing_api_key_validation() {
+        let result = ConfigBuilder::default()
+            .api_base("https://example.com")
+            .build();
+
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("api_key is required"));
+    }
+
+    #[test]
+    fn test_invalid_base_url_validation() {
+        let result = ConfigBuilder::default()
+            .api_base("not-a-valid-url")
+            .api_key("test")
+            .build();
+
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("Invalid base URL"));
+    }
+
+    #[test]
+    fn test_url_with_invalid_base() {
+        let config = Config {
+            api_base: Some("invalid-url".to_string()),
+            api_key: "test".into(),
+            headers: ConfigBuilder::build_headers(&"test".into()),
+        };
+
+        let result = config.url("/test");
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            ConfigError::InvalidBaseUrl(_) => {} // Expected
+            _ => panic!("Expected InvalidBaseUrl error"),
+        }
+    }
+
+    #[test]
+    fn test_url_with_invalid_path() {
+        let instance = ConfigBuilder::default()
+            .api_base("https://example.com")
+            .api_key("test")
+            .build()
+            .unwrap();
+
+        // Test with a path that would cause URL joining to fail
+        let result = instance.url("://invalid");
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            ConfigError::InvalidPath(_) => {} // Expected
+            _ => panic!("Expected InvalidPath error"),
+        }
     }
 }

@@ -1,4 +1,4 @@
-use std::{fmt::Debug, pin::Pin, time::Duration};
+use std::{fmt::Debug, pin::Pin, sync::Arc, time::Duration};
 
 use async_stream::try_stream;
 use bytes::Bytes;
@@ -14,9 +14,9 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub struct Client {
-    http_client: reqwest::Client,
-    config: Config,
-    backoff: backoff::ExponentialBackoff,
+    http_client: Arc<reqwest::Client>,
+    config: Arc<Config>,
+    backoff: Arc<backoff::ExponentialBackoff>,
 }
 
 /// Builder for constructing a Client with custom configuration
@@ -25,6 +25,7 @@ pub struct ClientBuilder {
     http_client: Option<reqwest::Client>,
     config: Option<Config>,
     backoff: Option<backoff::ExponentialBackoff>,
+    timeout: Option<Duration>,
 }
 
 impl Default for ClientBuilder {
@@ -40,6 +41,7 @@ impl ClientBuilder {
             http_client: None,
             config: None,
             backoff: None,
+            timeout: None,
         }
     }
 
@@ -63,8 +65,7 @@ impl ClientBuilder {
 
     /// Convenience method to set API key
     pub fn api_key<S: Into<String>>(mut self, api_key: S) -> Self {
-        let config = self.config.take().unwrap_or_default();
-        let mut config = config;
+        let mut config = self.config.take().unwrap_or_default();
         config.set_api_key(api_key.into().into());
         self.config = Some(config);
         self
@@ -87,6 +88,12 @@ impl ClientBuilder {
         self
     }
 
+    /// Set request timeout (default: 30 seconds)
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
     /// Build the final Client
     pub fn build(self) -> Client {
         let mut backoff = self.backoff.unwrap_or_default();
@@ -95,10 +102,21 @@ impl ClientBuilder {
             backoff.max_elapsed_time = Some(Duration::from_secs(120)); // 2 minutes
         }
 
+        // Build HTTP client with timeout if not provided
+        let http_client = self.http_client.unwrap_or_else(|| {
+            let mut client_builder = reqwest::Client::builder();
+
+            // Set timeout (default: 30 seconds)
+            let timeout = self.timeout.unwrap_or_else(|| Duration::from_secs(30));
+            client_builder = client_builder.timeout(timeout);
+
+            client_builder.build().expect("Failed to build HTTP client")
+        });
+
         Client {
-            http_client: self.http_client.unwrap_or_else(|| reqwest::Client::new()),
-            config: self.config.unwrap_or_default(),
-            backoff,
+            http_client: Arc::new(http_client),
+            config: Arc::new(self.config.unwrap_or_default()),
+            backoff: Arc::new(backoff),
         }
     }
 }
@@ -127,9 +145,12 @@ impl Client {
 
     /// Set API key (legacy method, prefer builder())
     pub fn with_api_key(self, api_key: String) -> Self {
-        let mut config = self.config;
+        let mut config = (*self.config).clone();
         config.set_api_key(api_key.into());
-        Client { config, ..self }
+        Client {
+            config: Arc::new(config),
+            ..self
+        }
     }
 
     /// Build client with all components (legacy method, prefer builder())
@@ -185,6 +206,7 @@ impl Client {
         crate::operation::embeddings::Embeddings::new(self)
     }
 
+    #[must_use]
     pub(crate) async fn post_stream<I, O>(
         &self,
         path: &str,
@@ -194,14 +216,18 @@ impl Client {
         I: Serialize,
         O: DeserializeOwned + std::marker::Send + 'static,
     {
+        let url = self
+            .config
+            .url(path)
+            .map_err(|e| DashScopeError::InvalidArgument(e.to_string()))?;
         let event_source = self
             .http_client
-            .post(self.config.url(path))
-            .headers(self.config.headers())
+            .post(url)
+            .headers(self.config.headers().clone())
             .json(&request)
             .eventsource()?;
 
-        Ok(stream(event_source))
+        Ok(Box::pin(stream(event_source)))
     }
 
     pub(crate) async fn post<I, O>(&self, path: &str, request: I) -> Result<O, DashScopeError>
@@ -210,10 +236,14 @@ impl Client {
         O: DeserializeOwned,
     {
         let request_maker = || async {
+            let url = self
+                .config
+                .url(path)
+                .map_err(|e| DashScopeError::InvalidArgument(e.to_string()))?;
             Ok(self
                 .http_client
-                .post(self.config.url(path))
-                .headers(self.config.headers())
+                .post(url)
+                .headers(self.config.headers().clone())
                 .json(&request)
                 .build()?)
         };
@@ -230,7 +260,7 @@ impl Client {
         let bytes = self.execute_raw(request_maker).await?;
 
         let response: O = serde_json::from_slice(bytes.as_ref())
-            .map_err(|e| map_deserialization_error(e, bytes.as_ref()))?;
+            .map_err(|e| map_deserialization_error(e, bytes.clone()))?;
 
         Ok(response)
     }
@@ -240,9 +270,9 @@ impl Client {
         M: Fn() -> Fut,
         Fut: core::future::Future<Output = Result<reqwest::Request, DashScopeError>>,
     {
-        let client = self.http_client.clone();
+        let client = Arc::clone(&self.http_client);
 
-        backoff::future::retry(self.backoff.clone(), || async {
+        backoff::future::retry((*self.backoff).clone(), || async {
             let request = request_maker().await.map_err(backoff::Error::Permanent)?;
             let response = client
                 .execute(request)
@@ -279,7 +309,7 @@ impl Client {
             // Deserialize response body from either error object or actual response object
             if !status.is_success() {
                 let api_error: ApiError = serde_json::from_slice(bytes.as_ref())
-                    .map_err(|e| map_deserialization_error(e, bytes.as_ref()))
+                    .map_err(|e| map_deserialization_error(e, bytes.clone()))
                     .map_err(backoff::Error::Permanent)?;
 
                 if status.as_u16() == 429 {
@@ -292,6 +322,18 @@ impl Client {
                     return Err(backoff::Error::Transient {
                         err: DashScopeError::ApiError(api_error),
                         retry_after,
+                    });
+                } else if status.is_server_error() && status != reqwest::StatusCode::NOT_IMPLEMENTED
+                {
+                    // Server errors (5xx) are generally transient, except 501 Not Implemented
+                    tracing::warn!(
+                        "Server error ({}): {} - retrying",
+                        status.as_u16(),
+                        api_error.message
+                    );
+                    return Err(backoff::Error::Transient {
+                        err: DashScopeError::ApiError(api_error),
+                        retry_after: None,
                     });
                 } else {
                     return Err(backoff::Error::Permanent(DashScopeError::ApiError(
@@ -324,29 +366,17 @@ where
                 }
                 Ok(Event::Open) => continue,
                 Ok(Event::Message(message)) => {
-                    // First, deserialize to a generic JSON Value to inspect it without failing.
-                    let json_value: serde_json::Value = match serde_json::from_str(&message.data) {
-                        Ok(val) => val,
-                        Err(e) => {
-                            Err(map_deserialization_error(e, message.data.as_bytes()))?;
-                            continue;
-                        }
-                    };
-
-                    // Now, deserialize from the `Value` to the target type `O`.
-                    let response = serde_json::from_value::<O>(json_value.clone())
-                        .map_err(|e| map_deserialization_error(e, message.data.as_bytes()))?;
+                    // Direct deserialization to target type O for better performance
+                    let response: O = serde_json::from_str(&message.data)
+                        .map_err(|e| map_deserialization_error(e, Bytes::from(message.data.clone())))?;
 
                     // Yield the successful message
                     yield response;
 
                     // Check for finish reason after sending the message.
                     // This ensures the final message with "stop" is delivered.
-                    let finish_reason = json_value
-                        .pointer("/output/choices/0/finish_reason")
-                        .and_then(|v| v.as_str());
-
-                    if let Some("stop") = finish_reason {
+                    // Parse JSON only for finish reason check to avoid double parsing
+                    if message.data.contains("\"finish_reason\":\"stop\"") {
                         break;
                     }
                 }

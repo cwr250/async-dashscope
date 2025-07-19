@@ -29,12 +29,13 @@ impl<'a> Audio<'a> {
         // 检查请求是否明确设置为非流式，如果是，则返回错误。
         if request.stream == Some(true) {
             return Err(DashScopeError::InvalidArgument(
-                "When stream is true, use Audio::call_stream".into(),
+                "When stream is true, use Audio::tts_stream".into(),
             ));
         }
         self.client.post(AUDIO_PATH, request).await
     }
 
+    #[must_use]
     pub async fn tts_stream(
         &self,
         mut request: TextToSpeechParam,
@@ -42,7 +43,7 @@ impl<'a> Audio<'a> {
         // 检查请求是否明确设置为非流式，如果是，则返回错误。
         if request.stream == Some(false) {
             return Err(DashScopeError::InvalidArgument(
-                "When stream is false, use Audio::call".into(),
+                "When stream is false, use Audio::tts".into(),
             ));
         }
         // 确保 stream 设置为 true 以启用流式响应

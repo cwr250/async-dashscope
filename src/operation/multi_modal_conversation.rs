@@ -69,6 +69,7 @@ impl<'a> MultiModalConversation<'a> {
     /// # 错误
     /// 如果 `request` 参数中的 `stream` 属性为 `Some(false)`，
     /// 函数将返回一个错误，提示用户应使用非流式处理的 `call` 方法。
+    #[must_use]
     pub async fn call_stream(
         &self,
         mut request: MultiModalConversationParam,
