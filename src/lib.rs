@@ -5,5 +5,5 @@ pub mod config;
 pub mod error;
 pub mod operation;
 
-pub use client::Client;
+pub use client::{Client, ClientBuilder};
 pub(crate) mod oss_util;

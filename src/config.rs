@@ -6,11 +6,12 @@
 // https://dashscope.aliyuncs.com/api/v1/services/aigc/text2image/image-synthesis - 创意海报生成API参考
 
 use derive_builder::Builder;
-use reqwest::header::AUTHORIZATION;
+use reqwest::header::{AUTHORIZATION, USER_AGENT};
 use secrecy::{ExposeSecret as _, SecretString};
 use url::Url;
 
 pub const DASHSCOPE_API_BASE: &str = "https://dashscope.aliyuncs.com/api/v1";
+pub const USER_AGENT_VALUE: &str = concat!("async-dashscope/", env!("CARGO_PKG_VERSION"));
 
 /// # Config
 ///
@@ -92,6 +93,12 @@ impl Config {
             format!("Bearer {}", self.api_key.expose_secret())
                 .parse()
                 .expect("authorization header should parse successfully"),
+        );
+        headers.insert(
+            USER_AGENT,
+            USER_AGENT_VALUE
+                .parse()
+                .expect("static User-Agent header should parse successfully"),
         );
         headers
     }

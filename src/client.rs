@@ -1,50 +1,148 @@
-use std::{fmt::Debug, pin::Pin};
+use std::{fmt::Debug, pin::Pin, time::Duration};
 
 use async_stream::try_stream;
 use bytes::Bytes;
 use reqwest_eventsource::{Event, EventSource, RequestBuilderExt as _};
-use serde::{de::DeserializeOwned, Serialize};
+
+use serde::{Serialize, de::DeserializeOwned};
 use tokio_stream::{Stream, StreamExt as _};
 
 use crate::{
     config::Config,
-    error::{map_deserialization_error, ApiError, DashScopeError},
+    error::{ApiError, DashScopeError, map_deserialization_error},
 };
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct Client {
     http_client: reqwest::Client,
     config: Config,
     backoff: backoff::ExponentialBackoff,
 }
 
+/// Builder for constructing a Client with custom configuration
+#[derive(Debug, Clone)]
+pub struct ClientBuilder {
+    http_client: Option<reqwest::Client>,
+    config: Option<Config>,
+    backoff: Option<backoff::ExponentialBackoff>,
+}
+
+impl Default for ClientBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ClientBuilder {
+    /// Create a new ClientBuilder with default settings
+    pub fn new() -> Self {
+        Self {
+            http_client: None,
+            config: None,
+            backoff: None,
+        }
+    }
+
+    /// Set a custom reqwest::Client (for timeouts, proxy, TLS config, etc.)
+    pub fn http_client(mut self, client: reqwest::Client) -> Self {
+        self.http_client = Some(client);
+        self
+    }
+
+    /// Set the configuration (API key, base URL, etc.)
+    pub fn config(mut self, config: Config) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    /// Set a custom backoff strategy for retries
+    pub fn backoff(mut self, backoff: backoff::ExponentialBackoff) -> Self {
+        self.backoff = Some(backoff);
+        self
+    }
+
+    /// Convenience method to set API key
+    pub fn api_key<S: Into<String>>(mut self, api_key: S) -> Self {
+        let config = self.config.take().unwrap_or_default();
+        let mut config = config;
+        config.set_api_key(api_key.into().into());
+        self.config = Some(config);
+        self
+    }
+
+    /// Set maximum retry time (default: 2 minutes)
+    pub fn max_retry_duration(mut self, duration: Duration) -> Self {
+        let mut backoff = self.backoff.take().unwrap_or_default();
+        backoff.max_elapsed_time = Some(duration);
+        self.backoff = Some(backoff);
+        self
+    }
+
+    /// Set maximum number of retries (default: unlimited within time bound)
+    /// Note: backoff crate doesn't directly support max count, so we set a reasonable max time
+    pub fn max_retry_count(mut self, _count: u64) -> Self {
+        let mut backoff = self.backoff.take().unwrap_or_default();
+        backoff.max_elapsed_time = Some(Duration::from_secs(300)); // 5 minutes default
+        self.backoff = Some(backoff);
+        self
+    }
+
+    /// Build the final Client
+    pub fn build(self) -> Client {
+        let mut backoff = self.backoff.unwrap_or_default();
+        // Set sensible defaults for production use
+        if backoff.max_elapsed_time.is_none() {
+            backoff.max_elapsed_time = Some(Duration::from_secs(120)); // 2 minutes
+        }
+
+        Client {
+            http_client: self.http_client.unwrap_or_else(|| reqwest::Client::new()),
+            config: self.config.unwrap_or_default(),
+            backoff,
+        }
+    }
+}
+
+impl Default for Client {
+    fn default() -> Self {
+        ClientBuilder::default().build()
+    }
+}
+
 impl Client {
+    /// Create a new Client with default settings
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn with_config(config: Config) -> Self {
-        Self {
-            http_client: reqwest::Client::new(),
-            config,
-            backoff: backoff::ExponentialBackoff::default(),
-        }
-    }
-    pub fn with_api_key(mut self, api_key: String) -> Self {
-        self.config.set_api_key(api_key.into());
-        self
+    /// Create a ClientBuilder for custom configuration
+    pub fn builder() -> ClientBuilder {
+        ClientBuilder::new()
     }
 
+    /// Create a Client with custom configuration (legacy method, prefer builder())
+    pub fn with_config(config: Config) -> Self {
+        ClientBuilder::new().config(config).build()
+    }
+
+    /// Set API key (legacy method, prefer builder())
+    pub fn with_api_key(self, api_key: String) -> Self {
+        let mut config = self.config;
+        config.set_api_key(api_key.into());
+        Client { config, ..self }
+    }
+
+    /// Build client with all components (legacy method, prefer builder())
     pub fn build(
         http_client: reqwest::Client,
         config: Config,
         backoff: backoff::ExponentialBackoff,
     ) -> Self {
-        Self {
-            http_client,
-            config,
-            backoff,
-        }
+        ClientBuilder::new()
+            .http_client(http_client)
+            .config(config)
+            .backoff(backoff)
+            .build()
     }
 
     /// 获取当前实例的生成（Generation）信息
@@ -103,7 +201,7 @@ impl Client {
             .json(&request)
             .eventsource()?;
 
-        Ok(stream(event_source).await)
+        Ok(stream(event_source))
     }
 
     pub(crate) async fn post<I, O>(&self, path: &str, request: I) -> Result<O, DashScopeError>
@@ -153,6 +251,25 @@ impl Client {
                 .map_err(backoff::Error::Permanent)?;
 
             let status = response.status();
+
+            // Extract Retry-After header before consuming response
+            let retry_after = if status.as_u16() == 429 {
+                response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|h| h.to_str().ok())
+                    .and_then(|s| {
+                        // Try parsing as seconds first, then as HTTP date
+                        s.parse::<u64>().ok().map(Duration::from_secs).or_else(|| {
+                            // If it's a date string, calculate duration from now
+                            // For simplicity, we'll just use a default duration
+                            Some(Duration::from_secs(60))
+                        })
+                    })
+            } else {
+                None
+            };
+
             let bytes = response
                 .bytes()
                 .await
@@ -166,11 +283,15 @@ impl Client {
                     .map_err(backoff::Error::Permanent)?;
 
                 if status.as_u16() == 429 {
-                    // Rate limited retry...
-                    tracing::warn!("Rate limited: {}", api_error.message);
+                    // Rate limited - honor Retry-After header if present
+                    tracing::warn!(
+                        "Rate limited: {} (retry after: {:?})",
+                        api_error.message,
+                        retry_after
+                    );
                     return Err(backoff::Error::Transient {
                         err: DashScopeError::ApiError(api_error),
-                        retry_after: None,
+                        retry_after,
                     });
                 } else {
                     return Err(backoff::Error::Permanent(DashScopeError::ApiError(
@@ -183,13 +304,13 @@ impl Client {
         })
         .await
     }
-    
+
     pub fn config(&self) -> &Config {
         &self.config
     }
 }
 
-pub(crate) async fn stream<O>(
+pub(crate) fn stream<O>(
     mut event_source: EventSource,
 ) -> Pin<Box<dyn Stream<Item = Result<O, DashScopeError>> + Send>>
 where
@@ -239,22 +360,44 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::config::ConfigBuilder;
-
     use super::*;
+    use secrecy::ExposeSecret;
 
     #[test]
     pub fn test_config() {
-        let config = ConfigBuilder::default()
-            .api_key("test key")
-            .build()
-            .unwrap();
-        let client = Client::with_config(config);
+        let client = Client::builder().api_key("test key").build();
 
         for header in client.config.headers().iter() {
             if header.0 == "authorization" {
                 assert_eq!(header.1, "Bearer test key");
             }
         }
+    }
+
+    #[test]
+    pub fn test_client_builder() {
+        let client = Client::builder()
+            .api_key("test-key")
+            .max_retry_duration(std::time::Duration::from_secs(60))
+            .build();
+
+        // Verify the client was built successfully
+        assert_eq!(client.config().api_key().expose_secret(), "test-key");
+
+        // Verify User-Agent header is set
+        let headers = client.config().headers();
+        assert!(headers.contains_key("user-agent"));
+        let user_agent = headers.get("user-agent").unwrap().to_str().unwrap();
+        assert!(user_agent.starts_with("async-dashscope/"));
+    }
+
+    #[test]
+    pub fn test_default_client() {
+        let client = Client::new();
+
+        // Should have default configuration
+        let headers = client.config().headers();
+        assert!(headers.contains_key("user-agent"));
+        assert!(headers.contains_key("content-type"));
     }
 }
