@@ -19,6 +19,10 @@ pub enum DashScopeError {
         source: serde_json::Error,
         raw_response: Bytes,
     },
+    // 新增
+    #[error("failed to serialize json for websocket: {0}")]
+    JSONSerialize(String),
+
     #[error("{0}")]
     ElementError(String),
     #[error("{0}")]
@@ -35,6 +39,10 @@ pub enum DashScopeError {
 
     #[error("configuration error: {0}")]
     ConfigError(#[from] ConfigError),
+
+    // 新增
+    #[error("websocket error: {0}")]
+    WebSocketError(String),
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -61,6 +69,13 @@ impl Display for ApiError {
 impl From<crate::operation::common::ParametersBuilderError> for DashScopeError {
     fn from(error: crate::operation::common::ParametersBuilderError) -> Self {
         DashScopeError::InvalidArgument(error.to_string())
+    }
+}
+
+// 新增 From impl，方便转换
+impl From<tokio_tungstenite::tungstenite::Error> for DashScopeError {
+    fn from(e: tokio_tungstenite::tungstenite::Error) -> Self {
+        DashScopeError::WebSocketError(e.to_string())
     }
 }
 
@@ -120,7 +135,7 @@ mod tests {
 
         let error = DashScopeError::JSONDeserialize {
             source: serde_error,
-            raw_response: raw_response.clone(),
+            raw_response: bytes::Bytes::from(raw_response.clone()),
         };
 
         let error_str = format!("{}", error);
@@ -138,7 +153,7 @@ mod tests {
 
         let error = DashScopeError::JSONDeserialize {
             source: serde_error,
-            raw_response: long_response,
+            raw_response: bytes::Bytes::from(long_response),
         };
 
         let error_str = format!("{}", error);
@@ -153,14 +168,14 @@ mod tests {
         let invalid_json = b"{ invalid json }";
         let serde_error = serde_json::from_slice::<serde_json::Value>(invalid_json).unwrap_err();
 
-        let result = map_deserialization_error(serde_error, invalid_json);
+        let result = map_deserialization_error(serde_error, bytes::Bytes::from(&invalid_json[..]));
 
         match result {
             DashScopeError::JSONDeserialize {
                 source: _,
                 raw_response,
             } => {
-                assert_eq!(raw_response, invalid_json);
+                assert_eq!(raw_response, bytes::Bytes::from(&invalid_json[..]));
             }
             _ => panic!("Expected JSONDeserialize error"),
         }

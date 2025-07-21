@@ -21,6 +21,7 @@ pub enum ConfigError {
 }
 
 pub const DASHSCOPE_API_BASE: &str = "https://dashscope.aliyuncs.com/api/v1";
+pub const DASHSCOPE_ASR_WS_URL: &str = "wss://dashscope.aliyuncs.com/api-ws/v1/inference";
 pub const USER_AGENT_VALUE: &str = concat!("async-dashscope/", env!("CARGO_PKG_VERSION"));
 
 /// # Config
@@ -41,6 +42,9 @@ pub struct Config {
     #[builder(setter(into, strip_option))]
     #[builder(default = "self.default_base_url()")]
     api_base: Option<String>,
+    #[builder(setter(into, strip_option))]
+    #[builder(default = "self.default_asr_ws_url()")]
+    asr_ws_url: Option<String>,
     api_key: SecretString,
     headers: reqwest::header::HeaderMap,
 }
@@ -48,6 +52,10 @@ pub struct Config {
 impl ConfigBuilder {
     fn default_base_url(&self) -> Option<String> {
         Some(DASHSCOPE_API_BASE.to_string())
+    }
+
+    fn default_asr_ws_url(&self) -> Option<String> {
+        Some(DASHSCOPE_ASR_WS_URL.to_string())
     }
 
     pub fn build(&self) -> Result<Config, ConfigBuilderError> {
@@ -67,6 +75,11 @@ impl ConfigBuilder {
             .clone()
             .unwrap_or_else(|| self.default_base_url());
 
+        let asr_ws_url = self
+            .asr_ws_url
+            .clone()
+            .unwrap_or_else(|| self.default_asr_ws_url());
+
         // Validate base URL if provided
         if let Some(ref base) = api_base {
             Url::parse(base).map_err(|e| {
@@ -79,6 +92,7 @@ impl ConfigBuilder {
 
         Ok(Config {
             api_base,
+            asr_ws_url,
             api_key,
             headers,
         })
@@ -158,6 +172,11 @@ impl Config {
     pub fn api_key(&self) -> &SecretString {
         &self.api_key
     }
+
+    /// Get the ASR WebSocket URL
+    pub fn asr_ws_url(&self) -> &str {
+        self.asr_ws_url.as_deref().unwrap_or(DASHSCOPE_ASR_WS_URL)
+    }
 }
 
 impl Default for Config {
@@ -169,6 +188,7 @@ impl Default for Config {
 
         Self {
             api_base: Some(DASHSCOPE_API_BASE.to_string()),
+            asr_ws_url: Some(DASHSCOPE_ASR_WS_URL.to_string()),
             api_key,
             headers,
         }
@@ -280,6 +300,7 @@ mod tests {
     fn test_url_with_invalid_base() {
         let config = Config {
             api_base: Some("invalid-url".to_string()),
+            asr_ws_url: Some(DASHSCOPE_ASR_WS_URL.to_string()),
             api_key: "test".into(),
             headers: ConfigBuilder::build_headers(&"test".into()),
         };
@@ -309,5 +330,46 @@ mod tests {
             ConfigError::InvalidPath(_) => {} // Expected
             _ => panic!("Expected InvalidPath error"),
         }
+    }
+
+    #[test]
+    fn test_asr_ws_url_default() {
+        let config = ConfigBuilder::default().api_key("test").build().unwrap();
+
+        assert_eq!(config.asr_ws_url(), DASHSCOPE_ASR_WS_URL);
+    }
+
+    #[test]
+    fn test_asr_ws_url_custom() {
+        let custom_url = "wss://custom-dashscope.example.com/api-ws/v1/inference";
+        let config = ConfigBuilder::default()
+            .api_key("test")
+            .asr_ws_url(custom_url)
+            .build()
+            .unwrap();
+
+        assert_eq!(config.asr_ws_url(), custom_url);
+    }
+
+    #[test]
+    fn test_asr_ws_url_vs_rest_api_base() {
+        let config = ConfigBuilder::default()
+            .api_key("test")
+            .api_base("https://dashscope.aliyuncs.com/api/v1")
+            .build()
+            .unwrap();
+
+        // Verify that ASR WebSocket URL is independent of REST API base
+        assert_eq!(
+            config.asr_ws_url(),
+            "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
+        );
+        assert_eq!(
+            config.url("").unwrap(),
+            "https://dashscope.aliyuncs.com/api/v1"
+        );
+
+        // They should be different - REST uses https/api/v1, WebSocket uses wss/api-ws/v1
+        assert_ne!(config.asr_ws_url(), config.url("").unwrap());
     }
 }

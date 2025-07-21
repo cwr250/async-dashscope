@@ -6,6 +6,14 @@ pub use tts::param::{
     Input as TextToSpeechInput, InputBuilder as TextToSpeechInputBuilder, TextToSpeechParam,
     TextToSpeechParamBuilder,
 };
+// 新增: 导出 ASR 模块的公共类型
+pub use asr::{
+    AsrConnection, AsrParaformerParams, AsrParaformerParamsBuilder, AsrParameters,
+    AsrParametersBuilder, AsrResponse,
+};
+
+// 新增: ASR 模块
+mod asr;
 mod tts;
 
 const AUDIO_PATH: &str = "/services/aigc/multimodal-generation/generation";
@@ -17,6 +25,12 @@ pub struct Audio<'a> {
 impl<'a> Audio<'a> {
     pub fn new(client: &'a Client) -> Self {
         Self { client }
+    }
+
+    // 新增: ASR 方法
+    /// 访问 ASR (语音识别) 功能。
+    pub fn asr(&self) -> asr::Asr<'_> {
+        asr::Asr::new(self.client)
     }
 
     /// 执行文本转语音(TTS)转换
