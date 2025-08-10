@@ -6,11 +6,13 @@ pub use tts::param::{
     Input as TextToSpeechInput, InputBuilder as TextToSpeechInputBuilder, TextToSpeechParam,
     TextToSpeechParamBuilder,
 };
-// 新增: 导出 ASR 模块的公共类型
+// ASR 参数和响应类型
 pub use asr::{
-    AsrConnection, AsrParaformerParams, AsrParaformerParamsBuilder, AsrParameters,
-    AsrParametersBuilder, AsrResponse,
+    AsrParaformerParams, AsrParaformerParamsBuilder, AsrParameters, AsrParametersBuilder,
+    AsrResponse,
 };
+// ASR 连接池 API
+pub use asr::{AsrPool, AsrPoolBuilder, AsrSession};
 
 // 新增: ASR 模块
 mod asr;
@@ -27,10 +29,9 @@ impl<'a> Audio<'a> {
         Self { client }
     }
 
-    // 新增: ASR 方法
-    /// 访问 ASR (语音识别) 功能。
-    pub fn asr(&self) -> asr::Asr<'_> {
-        asr::Asr::new(self.client)
+    /// ASR 连接池 Builder - 提供高性能的语音识别连接池
+    pub fn asr_pool(&self) -> asr::AsrPoolBuilder<'_> {
+        asr::AsrPoolBuilder::new(self.client)
     }
 
     /// 执行文本转语音(TTS)转换
