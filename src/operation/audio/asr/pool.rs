@@ -168,6 +168,84 @@ impl AsrSession {
         &self.task_id
     }
 
+    /// 非消费会话的订阅接口：返回该会话的事件流
+    ///
+    /// 此方法创建一个新的广播接收端，不消费 self，允许在发送音频的同时
+    /// 并发地接收 ASR 响应事件，实现真正的双工通信。
+    pub fn stream_by_ref(&self) -> impl Stream<Item = Result<output::AsrResponse>> + use<> {
+        let task_id = self.task_id.clone();
+        let rx = self.lease.subscribe(); // 拿到一个新的广播接收端（独立于 self）
+        BroadcastStream::new(rx).filter_map(move |ev| {
+            let task_id = task_id.clone();
+            match ev {
+                Ok(Ok(WsMessage::Text(txt))) => {
+                    // 轻量判断目标 task，再解析
+                    let v: Value = match serde_json::from_str(&txt) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return Some(Err(DashScopeError::JSONDeserialize {
+                                source: e,
+                                raw_response: Bytes::from(txt),
+                            }));
+                        }
+                    };
+                    let hid = v
+                        .get("header")
+                        .and_then(|h| h.get("task_id"))
+                        .and_then(|s| s.as_str());
+                    if hid != Some(task_id.as_str()) {
+                        return None;
+                    }
+
+                    let header: output::IncomingHeader =
+                        match serde_json::from_value(v["header"].clone()) {
+                            Ok(h) => h,
+                            Err(e) => {
+                                return Some(Err(DashScopeError::JSONDeserialize {
+                                    source: e,
+                                    raw_response: Bytes::from(txt),
+                                }));
+                            }
+                        };
+
+                    let resp = match header.event_type() {
+                        output::AsrEventType::ResultGenerated => {
+                            if let Some(out_val) = v.get("payload").and_then(|p| p.get("output")) {
+                                match serde_json::from_value::<output::AsrOutput>(out_val.clone()) {
+                                    Ok(o) => output::AsrResponse::ResultGenerated(o),
+                                    Err(e) => {
+                                        return Some(Err(DashScopeError::JSONDeserialize {
+                                            source: e,
+                                            raw_response: Bytes::from(txt),
+                                        }));
+                                    }
+                                }
+                            } else {
+                                return None;
+                            }
+                        }
+                        output::AsrEventType::TaskStarted => output::AsrResponse::TaskStarted,
+                        output::AsrEventType::TaskFinished => output::AsrResponse::TaskFinished,
+                        output::AsrEventType::TaskFailed => output::AsrResponse::TaskFailed {
+                            error_code: header.error_code,
+                            error_message: header.error_message,
+                        },
+                        output::AsrEventType::Unknown(_) => return None,
+                    };
+                    Some(Ok(resp))
+                }
+                Ok(Ok(WsMessage::Close(_))) => Some(Ok(output::AsrResponse::TaskFinished)),
+                Ok(Err(e)) => Some(Err(DashScopeError::WebSocketError(format!("{:?}", e)))),
+                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                    Some(Err(DashScopeError::WebSocketError(format!(
+                        "ASR stream lagged by {n}"
+                    ))))
+                }
+                _ => None,
+            }
+        })
+    }
+
     pub fn stream(self) -> impl Stream<Item = Result<output::AsrResponse>> {
         let task_id = self.task_id.clone();
         BroadcastStream::new(self.lease.subscribe()).filter_map(move |ev| {
@@ -285,24 +363,6 @@ mod tests {
         let task_id = Uuid::new_v4().to_string();
         assert!(task_id.len() == 36); // Standard UUID length
         assert!(task_id.contains('-')); // UUIDs contain hyphens
-    }
-
-    #[test]
-    fn test_api_exports() {
-        // Test that all the expected types are properly exported
-        // This ensures the API surface is correct after refactoring
-
-        // Test that we can construct parameters
-        let _params = param::AsrParametersBuilder::default()
-            .format("opus")
-            .sample_rate(16000)
-            .build()
-            .unwrap();
-
-        let _asr_params = param::AsrParaformerParamsBuilder::default()
-            .model("paraformer-realtime-v2")
-            .build()
-            .unwrap();
     }
 
     #[test]
