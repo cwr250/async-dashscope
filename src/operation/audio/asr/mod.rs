@@ -11,4 +11,4 @@ pub use param::{
 pub use output::AsrResponse;
 
 // 导出连接池相关类型
-pub use pool::{AsrPool, AsrPoolBuilder, AsrSession};
+pub use pool::{AsrDuplexSession, AsrEvent, AsrPool, AsrPoolBuilder, AsrSession};

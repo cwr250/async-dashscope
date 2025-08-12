@@ -11,8 +11,8 @@ pub use asr::{
     AsrParaformerParams, AsrParaformerParamsBuilder, AsrParameters, AsrParametersBuilder,
     AsrResponse,
 };
-// ASR 连接池 API
-pub use asr::{AsrPool, AsrPoolBuilder, AsrSession};
+// ASR 连接池 API 和全双工会话
+pub use asr::{AsrDuplexSession, AsrEvent, AsrPool, AsrPoolBuilder, AsrSession};
 
 // 新增: ASR 模块
 mod asr;
