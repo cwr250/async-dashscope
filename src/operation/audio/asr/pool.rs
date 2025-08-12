@@ -8,6 +8,7 @@ use bytes::Bytes;
 use futures_util::Stream;
 use reqwest::header::{AUTHORIZATION, USER_AGENT};
 use serde_json::Value;
+use std::time::Duration;
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use tokio_tungstenite::tungstenite::{Message as WsMessage, client::IntoClientRequest};
 use uuid::Uuid;
@@ -22,6 +23,10 @@ pub struct AsrPoolBuilder<'a> {
     size: usize,
     write_cap: usize,
     read_broadcast_cap: usize,
+    initial_size: usize,
+    ping_interval: Option<Duration>,
+    connect_timeout: Duration,
+    message_timeout: Duration,
 }
 
 impl<'a> AsrPoolBuilder<'a> {
@@ -31,6 +36,10 @@ impl<'a> AsrPoolBuilder<'a> {
             size: 4,
             write_cap: 64,
             read_broadcast_cap: 1024,
+            initial_size: 0,
+            ping_interval: Some(Duration::from_secs(30)),
+            connect_timeout: Duration::from_secs(15),
+            message_timeout: Duration::from_secs(5),
         }
     }
 
@@ -44,6 +53,26 @@ impl<'a> AsrPoolBuilder<'a> {
     }
     pub fn read_broadcast_capacity(mut self, n: usize) -> Self {
         self.read_broadcast_cap = n.max(64);
+        self
+    }
+
+    pub fn initial_size(mut self, n: usize) -> Self {
+        self.initial_size = n;
+        self
+    }
+
+    pub fn ping_interval(mut self, dur: Option<Duration>) -> Self {
+        self.ping_interval = dur;
+        self
+    }
+
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+
+    pub fn message_timeout(mut self, timeout: Duration) -> Self {
+        self.message_timeout = timeout;
         self
     }
 
@@ -66,7 +95,12 @@ impl<'a> AsrPoolBuilder<'a> {
         let pool = WsPoolBuilder::new(request, self.size)
             .write_capacity(self.write_cap)
             .read_broadcast_capacity(self.read_broadcast_cap)
-            .build()?;
+            .ping_interval(self.ping_interval)
+            .initial_size(self.initial_size)
+            .connect_timeout(self.connect_timeout)
+            .message_timeout(self.message_timeout)
+            .build()
+            .await?;
         Ok(AsrPool { pool })
     }
 }
@@ -78,8 +112,23 @@ pub struct AsrSession {
 }
 
 impl AsrPool {
-    pub async fn start_session(&self, params: param::AsrParaformerParams) -> Result<AsrSession> {
+    /// Test connection acquisition for health checks
+    pub async fn test_acquire(&self) -> Result<()> {
         let lease = self.pool.acquire().await?;
+        drop(lease); // Immediately return to pool
+        Ok(())
+    }
+
+    /// Acquire a connection with timeout for better resilience during transient failures
+    pub async fn acquire_with_timeout(&self, timeout: Duration) -> Result<WsLease> {
+        self.pool.acquire_with_timeout(timeout).await
+    }
+
+    pub async fn start_session(&self, params: param::AsrParaformerParams) -> Result<AsrSession> {
+        let lease = self
+            .pool
+            .acquire_with_timeout(Duration::from_millis(500))
+            .await?;
         let task_id = Uuid::new_v4().to_string();
 
         let run = param::RunTaskPayload::new(&params.model, &params.parameters);
@@ -135,6 +184,16 @@ impl AsrPool {
             }
         }
         Ok(final_text)
+    }
+
+    /// Close all connections in the pool
+    pub async fn close_all(&self) {
+        self.pool.close_all().await;
+    }
+
+    /// Get current pool status for observability
+    pub async fn status(&self) -> crate::ws::pool::PoolStatus {
+        self.pool.status().await
     }
 }
 

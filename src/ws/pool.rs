@@ -1,14 +1,32 @@
 use crate::error::{DashScopeError, Result};
 
-use backoff::ExponentialBackoff;
+use backoff::{ExponentialBackoff, backoff::Backoff};
 use futures_util::{SinkExt, StreamExt};
-use std::{sync::Arc, time::Duration};
-use tokio::sync::{Mutex, broadcast, mpsc, watch};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+use tokio::sync::{Mutex, Notify, broadcast, mpsc, watch};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{Message as WsMessage, handshake::client::Request},
 };
 use tracing::{error, info};
+
+static CONNECTION_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Pool status for observability
+#[derive(Debug, Clone)]
+pub struct PoolStatus {
+    pub total: usize,
+    pub available: usize,
+    pub in_use: usize,
+    pub reconnecting: usize,
+    pub max_size: usize,
+}
 
 // Use a cloneable error type for broadcast channel
 #[derive(Debug, Clone)]
@@ -45,6 +63,11 @@ struct PoolConfig {
     write_cap: usize,
     read_broadcast_cap: usize,
     ping_interval: Option<Duration>,
+    initial_size: usize,
+    connect_timeout: Duration,
+    message_timeout: Duration,
+    /// Notification for when connections become alive
+    alive_notify: Arc<Notify>,
 }
 
 #[derive(Debug)]
@@ -54,60 +77,326 @@ struct PooledConnection {
 }
 
 impl WsPool {
-    pub async fn acquire(&self) -> Result<WsLease> {
-        let mut connections = self.inner.connections.lock().await;
+    /// Warm up the pool by creating the specified number of connections
+    pub async fn warm_up(&self, target: usize) -> Result<()> {
+        let target = target.min(self.inner.config.max_size);
 
-        // First, try to find an available healthy connection
-        for pooled in connections.iter_mut() {
-            if !pooled.in_use && pooled.conn.is_alive() {
-                pooled.in_use = true;
-                let conn_id = pooled.conn.conn_id;
-                let write_tx = pooled.conn.write_tx.clone();
-                let read_rx = pooled.conn.read_tx.subscribe();
-                let pool = self.clone();
+        let mut remaining = target;
+        let mut attempt = 0;
+        let max_retries = 3;
+        let mut last_error: Option<String> = None;
 
-                return Ok(WsLease {
-                    conn_id,
-                    write_tx,
-                    read_rx,
-                    pool,
+        while remaining > 0 && attempt < max_retries {
+            // Check existing healthy connections count without holding lock during await
+            let existing = {
+                let g = self.inner.connections.lock().await;
+                g.iter().filter(|p| p.conn.is_alive()).count()
+            };
+            let need = remaining.saturating_sub(existing);
+            if need == 0 {
+                tracing::info!("ws warmup completed: target {} reached", target);
+                return Ok(());
+            }
+
+            if attempt > 0 {
+                tracing::info!(
+                    "ws warmup retry attempt {}/{}: need {} more connections",
+                    attempt + 1,
+                    max_retries,
+                    need
+                );
+            }
+
+            // Create connections concurrently to avoid holding lock during await
+            let mut tasks = Vec::with_capacity(need);
+            for _ in 0..need {
+                let cfg = self.inner.config.clone();
+                tasks.push(tokio::spawn({
+                    let alive_notify = self.inner.config.alive_notify.clone();
+                    async move {
+                        Connection::connect(
+                            cfg.request.clone(),
+                            cfg.backoff.clone(),
+                            cfg.write_cap,
+                            cfg.read_broadcast_cap,
+                            cfg.ping_interval,
+                            cfg.connect_timeout,
+                            cfg.message_timeout,
+                            alive_notify,
+                        )
+                        .await
+                    }
+                }));
+            }
+
+            let mut new_conns = Vec::with_capacity(need);
+            let mut errors = 0usize;
+            for t in tasks {
+                match t.await {
+                    Ok(Ok(conn)) => new_conns.push(conn),
+                    Ok(Err(e)) => {
+                        errors += 1;
+                        last_error = Some(format!("connection error: {}", e));
+                    }
+                    Err(e) => {
+                        errors += 1;
+                        last_error = Some(format!("task join error: {}", e));
+                    }
+                }
+            }
+
+            let successful = new_conns.len();
+            let mut g = self.inner.connections.lock().await;
+            for conn in new_conns {
+                g.push(PooledConnection {
+                    conn,
+                    in_use: false,
                 });
+            }
+
+            remaining = remaining.saturating_sub(successful);
+
+            if successful > 0 {
+                tracing::info!(
+                    "ws warmup attempt {}: {} successful, {} failed, {} remaining",
+                    attempt + 1,
+                    successful,
+                    errors,
+                    remaining
+                );
+            }
+
+            if remaining == 0 {
+                tracing::info!("ws warmup completed successfully: {} connections", target);
+                return Ok(());
+            }
+
+            attempt += 1;
+
+            // If not the last attempt and we had failures, wait before retry
+            if attempt < max_retries && errors > 0 {
+                let backoff_duration = Duration::from_millis(100 * (1 << attempt.min(4))); // Exponential backoff: 200ms, 400ms, 800ms
+                tracing::debug!(
+                    "ws warmup backing off for {:?} before retry",
+                    backoff_duration
+                );
+                tokio::time::sleep(backoff_duration).await;
             }
         }
 
-        // Remove dead connections
-        connections.retain(|pooled| pooled.conn.is_alive());
+        // Final check after all retries
+        let final_check = {
+            let g = self.inner.connections.lock().await;
+            g.iter().filter(|p| p.conn.is_alive()).count()
+        };
 
-        // If we have room, create a new connection
-        if connections.len() < self.inner.config.max_size {
-            let conn = Connection::connect(
-                self.inner.config.request.clone(),
-                self.inner.config.backoff.clone(),
-                self.inner.config.write_cap,
-                self.inner.config.read_broadcast_cap,
-                self.inner.config.ping_interval,
-            )
-            .await?;
-
-            let conn_id = conn.conn_id;
-            let write_tx = conn.write_tx.clone();
-            let read_rx = conn.read_tx.subscribe();
-
-            connections.push(PooledConnection { conn, in_use: true });
-
-            let pool = self.clone();
-            return Ok(WsLease {
-                conn_id,
-                write_tx,
-                read_rx,
-                pool,
-            });
+        if final_check == 0 {
+            return Err(DashScopeError::WebSocketError(
+                "warmup failed after retries: zero live connections".into(),
+            ));
         }
 
-        // Pool is full and no connections available
-        Err(DashScopeError::WebSocketError(
-            "Connection pool exhausted".into(),
-        ))
+        if final_check < target {
+            let error_detail = last_error.unwrap_or_else(|| "unknown error".to_string());
+            tracing::warn!(
+                "ws warmup partial success after {} attempts: {} successful out of {} target. Last error: {}",
+                attempt,
+                final_check,
+                target,
+                error_detail
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Get current pool status for observability
+    pub async fn status(&self) -> PoolStatus {
+        let connections = self.inner.connections.lock().await;
+
+        // Filter out finished connections for accurate statistics
+        let active_connections: Vec<_> = connections
+            .iter()
+            .filter(|p| !p.conn.task_handle.is_finished())
+            .collect();
+
+        let total = active_connections.len();
+        let in_use = active_connections.iter().filter(|p| p.in_use).count();
+        let alive = active_connections
+            .iter()
+            .filter(|p| p.conn.is_alive())
+            .count();
+        let available = active_connections
+            .iter()
+            .filter(|p| !p.in_use && p.conn.is_alive())
+            .count();
+        // Reconnecting = active connections that are not alive
+        let reconnecting = total - alive;
+
+        PoolStatus {
+            total,
+            available,
+            in_use,
+            reconnecting,
+            max_size: self.inner.config.max_size,
+        }
+    }
+
+    /// Close all connections in the pool
+    pub async fn close_all(&self) {
+        let mut g = self.inner.connections.lock().await;
+        g.clear(); // Connection Drop will abort connection actors
+    }
+
+    pub async fn acquire(&self) -> Result<WsLease> {
+        // Phase 1: Fast path - find available healthy connection under short lock
+        {
+            let mut connections = self.inner.connections.lock().await;
+
+            // Try to find an available healthy connection
+            for pooled in connections.iter_mut() {
+                if !pooled.in_use && pooled.conn.is_alive() {
+                    pooled.in_use = true;
+                    let conn_id = pooled.conn.conn_id;
+                    let write_tx = pooled.conn.write_tx.clone();
+                    let read_rx = pooled.conn.read_tx.subscribe();
+                    let pool = self.clone();
+
+                    return Ok(WsLease {
+                        conn_id,
+                        write_tx,
+                        read_rx,
+                        pool,
+                    });
+                }
+            }
+
+            // Clean up finished connections to avoid leaks
+            connections.retain(|pooled| !pooled.conn.task_handle.is_finished());
+
+            // Check if we can create a new connection (decide under lock, create outside)
+            if connections.len() >= self.inner.config.max_size {
+                // Check if we have reconnecting connections - if so, wait briefly
+                let reconnecting_count = connections
+                    .iter()
+                    .filter(|p| !p.conn.is_alive() && !p.conn.task_handle.is_finished())
+                    .count();
+
+                if reconnecting_count > 0 {
+                    tracing::debug!(
+                        "Pool full but {} connections reconnecting, waiting briefly...",
+                        reconnecting_count
+                    );
+                    // Drop lock before waiting
+                    drop(connections);
+
+                    // Wait for up to 200ms for a connection to become available
+                    let wait_result = tokio::time::timeout(
+                        Duration::from_millis(200),
+                        self.inner.config.alive_notify.notified(),
+                    )
+                    .await;
+
+                    if wait_result.is_ok() {
+                        // A connection became alive, retry fast path
+                        let mut connections = self.inner.connections.lock().await;
+                        for pooled in connections.iter_mut() {
+                            if !pooled.in_use && pooled.conn.is_alive() {
+                                pooled.in_use = true;
+                                let conn_id = pooled.conn.conn_id;
+                                let write_tx = pooled.conn.write_tx.clone();
+                                let read_rx = pooled.conn.read_tx.subscribe();
+                                let pool = self.clone();
+
+                                return Ok(WsLease {
+                                    conn_id,
+                                    write_tx,
+                                    read_rx,
+                                    pool,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                return Err(DashScopeError::WebSocketError(
+                    "Connection pool exhausted".into(),
+                ));
+            }
+        }
+
+        // Phase 2: Create connection outside lock (this can take seconds)
+        let conn = Connection::connect(
+            self.inner.config.request.clone(),
+            self.inner.config.backoff.clone(),
+            self.inner.config.write_cap,
+            self.inner.config.read_broadcast_cap,
+            self.inner.config.ping_interval,
+            self.inner.config.connect_timeout,
+            self.inner.config.message_timeout,
+            self.inner.config.alive_notify.clone(),
+        )
+        .await?;
+
+        let conn_id = conn.conn_id;
+        let write_tx = conn.write_tx.clone();
+        let read_rx = conn.read_tx.subscribe();
+
+        // Phase 3: Insert back into pool under short lock
+        {
+            let mut connections = self.inner.connections.lock().await;
+
+            // Race condition check: pool might be full now
+            if connections.len() >= self.inner.config.max_size {
+                // Drop the connection (will terminate actor) and return error
+                drop(conn);
+                return Err(DashScopeError::WebSocketError(
+                    "Connection pool exhausted".into(),
+                ));
+            }
+
+            connections.push(PooledConnection { conn, in_use: true });
+        }
+
+        let pool = self.clone();
+        Ok(WsLease {
+            conn_id,
+            write_tx,
+            read_rx,
+            pool,
+        })
+    }
+
+    /// Acquire a connection with retry logic for transient failures
+    ///
+    /// This method retries the acquire operation for up to the specified duration
+    /// when encountering "Connection pool exhausted" errors, which can happen
+    /// when all connections are temporarily reconnecting.
+    pub async fn acquire_with_timeout(&self, timeout: Duration) -> Result<WsLease> {
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        loop {
+            match self.acquire().await {
+                Ok(lease) => return Ok(lease),
+                Err(e) => {
+                    if tokio::time::Instant::now() < deadline {
+                        // Check if this is a "pool exhausted" error worth retrying
+                        if let DashScopeError::WebSocketError(msg) = &e {
+                            if msg.contains("Connection pool exhausted") {
+                                tracing::debug!("Pool exhausted, retrying in 20ms...");
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                                continue;
+                            }
+                        }
+                        // For other errors, return immediately
+                        return Err(e);
+                    } else {
+                        // Timeout reached
+                        return Err(e);
+                    }
+                }
+            }
+        }
     }
 
     async fn release_connection(&self, conn_id: usize) {
@@ -182,6 +471,9 @@ impl Connection {
         write_cap: usize,
         read_broadcast_cap: usize,
         ping_interval: Option<Duration>,
+        connect_timeout: Duration,
+        message_timeout: Duration,
+        alive_notify: Arc<Notify>,
     ) -> Result<Self> {
         let (write_tx, write_rx) = mpsc::channel(write_cap);
         let (read_tx, _) = broadcast::channel(read_broadcast_cap);
@@ -194,13 +486,13 @@ impl Connection {
             read_tx.clone(),
             alive_tx,
             ping_interval,
+            connect_timeout,
+            message_timeout,
+            alive_notify,
         ));
 
         Ok(Self {
-            conn_id: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as usize)
-                .unwrap_or(0),
+            conn_id: CONNECTION_ID_COUNTER.fetch_add(1, Ordering::Relaxed) as usize,
             write_tx,
             read_tx,
             alive_rx,
@@ -221,23 +513,28 @@ impl Drop for Connection {
 
 async fn connection_actor(
     request: Request,
-    _backoff: ExponentialBackoff,
+    mut backoff: ExponentialBackoff,
     mut write_rx: mpsc::Receiver<WsMessage>,
     read_tx: broadcast::Sender<WsResult>,
     alive_tx: watch::Sender<bool>,
     ping_interval: Option<Duration>,
+    connect_timeout: Duration,
+    message_timeout: Duration,
+    alive_notify: Arc<Notify>,
 ) {
     let _ = alive_tx.send(false);
 
     loop {
         info!("ws: connecting {}", request.uri());
 
-        let ws_result = connect_async(request.clone()).await;
+        let ws_result = tokio::time::timeout(connect_timeout, connect_async(request.clone())).await;
 
         match ws_result {
-            Ok((ws, _resp)) => {
+            Ok(Ok((ws, _resp))) => {
+                backoff.reset();
                 let (mut sink, mut stream) = ws.split();
                 let _ = alive_tx.send(true);
+                alive_notify.notify_waiters(); // Notify waiters that connection is alive
                 info!("ws: connected {}", request.uri());
 
                 let mut ping_ticker = ping_interval.map(tokio::time::interval);
@@ -257,7 +554,11 @@ async fn connection_actor(
                         tokio::select! {
                             biased;
                             Some(msg) = write_rx.recv() => {
-                                if let Err(_e) = sink.send(msg).await {
+                                if tokio::time::timeout(
+                                    message_timeout,
+                                    sink.send(msg)
+                                ).await.is_err() {
+                                    tracing::warn!("ws message send timeout after {:?} to {}, closing connection", message_timeout, request.uri());
                                     break;
                                 }
                             }
@@ -269,7 +570,11 @@ async fn connection_actor(
                                 }
                             } => {
                                 if ping_interval.is_some() {
-                                    if let Err(_e) = sink.send(WsMessage::Ping(Vec::new().into())).await {
+                                    if tokio::time::timeout(
+                                        message_timeout,
+                                        sink.send(WsMessage::Ping(Vec::new().into()))
+                                    ).await.is_err() {
+                                        tracing::warn!("ws ping send timeout after {:?} to {}, closing connection", message_timeout, request.uri());
                                         break;
                                     }
                                 }
@@ -289,10 +594,27 @@ async fn connection_actor(
                     }
                 }
             }
-            Err(e) => {
-                error!("ws connection failed: {e}, retrying...");
+            Ok(Err(e)) => {
+                error!(
+                    "ws connection failed to {}: {}, retrying after {:?}...",
+                    request.uri(),
+                    e,
+                    backoff.next_backoff().unwrap_or(Duration::from_secs(1))
+                );
                 let _ = alive_tx.send(false);
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                let sleep = backoff.next_backoff().unwrap_or(Duration::from_secs(1));
+                tokio::time::sleep(sleep).await;
+            }
+            Err(_) => {
+                error!(
+                    "ws connection timeout to {} after {:?}, retrying after {:?}...",
+                    request.uri(),
+                    connect_timeout,
+                    backoff.next_backoff().unwrap_or(Duration::from_secs(1))
+                );
+                let _ = alive_tx.send(false);
+                let sleep = backoff.next_backoff().unwrap_or(Duration::from_secs(1));
+                tokio::time::sleep(sleep).await;
             }
         }
     }
@@ -306,6 +628,9 @@ pub struct WsPoolBuilder {
     write_cap: usize,
     read_broadcast_cap: usize,
     ping_interval: Option<Duration>,
+    initial_size: usize,
+    connect_timeout: Duration,
+    message_timeout: Duration,
 }
 
 impl WsPoolBuilder {
@@ -321,6 +646,9 @@ impl WsPoolBuilder {
             write_cap: 64,
             read_broadcast_cap: 1024,
             ping_interval: Some(Duration::from_secs(30)),
+            initial_size: 0,
+            connect_timeout: Duration::from_secs(15),
+            message_timeout: Duration::from_secs(5),
         }
     }
 
@@ -344,7 +672,22 @@ impl WsPoolBuilder {
         self
     }
 
-    pub fn build(self) -> Result<WsPool> {
+    pub fn initial_size(mut self, n: usize) -> Self {
+        self.initial_size = n;
+        self
+    }
+
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+
+    pub fn message_timeout(mut self, timeout: Duration) -> Self {
+        self.message_timeout = timeout;
+        self
+    }
+
+    pub async fn build(self) -> Result<WsPool> {
         let config = PoolConfig {
             request: self.request,
             max_size: self.size,
@@ -352,6 +695,10 @@ impl WsPoolBuilder {
             write_cap: self.write_cap,
             read_broadcast_cap: self.read_broadcast_cap,
             ping_interval: self.ping_interval,
+            initial_size: self.initial_size,
+            connect_timeout: self.connect_timeout,
+            message_timeout: self.message_timeout,
+            alive_notify: Arc::new(Notify::new()),
         };
 
         let inner = PoolInner {
@@ -359,8 +706,14 @@ impl WsPoolBuilder {
             config,
         };
 
-        Ok(WsPool {
+        let pool = WsPool {
             inner: Arc::new(inner),
-        })
+        };
+
+        if pool.inner.config.initial_size > 0 {
+            pool.warm_up(pool.inner.config.initial_size).await?;
+        }
+
+        Ok(pool)
     }
 }
