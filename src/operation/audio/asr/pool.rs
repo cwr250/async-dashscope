@@ -5,7 +5,7 @@ use crate::{
     ws::pool::{WsLease, WsPool, WsPoolBuilder},
 };
 use bytes::Bytes;
-use futures_util::{Stream, StreamExt as FuturesStreamExt};
+use futures_util::Stream;
 use reqwest::header::{AUTHORIZATION, USER_AGENT};
 use serde_json::Value;
 use std::{
@@ -13,7 +13,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
-use tokio_stream::{StreamExt, wrappers::BroadcastStream};
+use tokio_stream::wrappers::BroadcastStream;
 use tokio_tungstenite::tungstenite::{Message as WsMessage, client::IntoClientRequest};
 use uuid::Uuid;
 
@@ -344,13 +344,12 @@ impl AsrPool {
         params: param::AsrParaformerParams,
         mut audio_stream: impl Stream<Item = Result<Vec<u8>>> + Unpin + Send + 'static,
     ) -> Result<String> {
-        let (mut session, rx) = self.start_session_with_subscription(params).await?;
+        let (session, rx) = self.start_session_with_subscription(params).await?;
         let session_task_id = session.task_id().to_string();
 
         // 关键：使用预订阅的receiver构造响应流，消除早期事件丢失风险
         let task_id_for_stream = session_task_id.clone();
         let mut resp_stream = {
-            use crate::ws::pool::WsResult;
             use tokio_stream::wrappers::BroadcastStream;
 
             tokio_stream::StreamExt::filter_map(BroadcastStream::new(rx), move |ev| {
@@ -561,7 +560,6 @@ impl AsrPool {
         // 使用预订阅的receiver构造响应流，消除早期事件丢失风险
         let task_id = session.task_id().to_string();
         let resp_stream = {
-            use crate::ws::pool::WsResult;
             use bytes::Bytes;
             use serde_json::Value;
             use tokio_stream::wrappers::BroadcastStream;

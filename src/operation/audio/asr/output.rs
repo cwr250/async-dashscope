@@ -68,7 +68,6 @@ pub enum AsrResponse {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct IncomingHeader {
     pub event: String,
-    pub task_id: String,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
 }

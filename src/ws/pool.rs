@@ -667,11 +667,6 @@ impl WsPoolBuilder {
         self
     }
 
-    pub fn backoff(mut self, b: ExponentialBackoff) -> Self {
-        self.backoff = b;
-        self
-    }
-
     pub fn initial_size(mut self, n: usize) -> Self {
         self.initial_size = n;
         self
