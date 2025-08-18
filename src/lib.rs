@@ -20,26 +20,14 @@ mod tests {
         let client = ClientBuilder::new()
             .api_key("test-key")
             .timeout(Duration::from_secs(10))
-            .build();
+            .build()
+            .unwrap();
 
         // Verify the client was built successfully
         assert!(client.config().api_key().expose_secret() == "test-key");
     }
 
-    #[test]
-    fn test_config_headers_cached() {
-        let config = config::ConfigBuilder::default()
-            .api_key("test-key")
-            .build()
-            .unwrap();
 
-        // Headers should be pre-built and cached
-        let headers1 = config.headers();
-        let headers2 = config.headers();
-
-        // Should return the same reference (cached)
-        assert!(std::ptr::eq(headers1, headers2));
-    }
 
     #[test]
     fn test_url_safety() {

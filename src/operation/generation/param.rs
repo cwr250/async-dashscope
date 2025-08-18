@@ -18,7 +18,7 @@ pub struct GenerationParam {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(setter(into, strip_option))]
-    #[builder(default=Some(false))]
+    #[builder(default=None)]
     pub stream: Option<bool>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -40,7 +40,7 @@ pub struct Message {
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(setter(into, strip_option))]
-    #[builder(default=Some(false))]
+    #[builder(default=None)]
     pub partial: Option<bool>,
 }
 
@@ -52,7 +52,7 @@ impl Message {
         Self {
             role: role.into(),
             content: content.into(),
-            partial: Some(false),
+            partial: None,
         }
     }
 }
@@ -143,6 +143,6 @@ mod tests {
 
         assert_eq!(message.role, "user");
         assert_eq!(message.content, "Hello world");
-        assert_eq!(message.partial, Some(false));
+        assert_eq!(message.partial, None);
     }
 }

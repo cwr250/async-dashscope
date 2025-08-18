@@ -13,13 +13,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Example 1: Basic client with just API key
     println!("📝 Example 1: Basic Client Configuration");
-    let basic_client = Client::builder().api_key("your-api-key-here").build();
+    let _basic_client = Client::builder().api_key("your-api-key-here").build().unwrap();
 
     println!("✅ Basic client created successfully");
-    println!(
-        "   User-Agent: {:?}",
-        basic_client.config().headers().get("user-agent")
-    );
+    println!("   Client configured with API key");
     println!();
 
     // Example 2: Client with custom HTTP configuration
@@ -30,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .user_agent("my-custom-app/1.0")
         .build()?;
 
-    let http_configured_client = Client::builder()
+    let _http_configured_client = Client::builder()
         .api_key("your-api-key-here")
         .http_client(custom_http_client)
         .build();
@@ -41,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Example 3: Client with custom retry strategy
     println!("🔄 Example 3: Custom Retry Strategy");
-    let retry_client = Client::builder()
+    let _retry_client = Client::builder()
         .api_key("your-api-key-here")
         .max_retry_duration(Duration::from_secs(60)) // Max 1 minute of retries
         .build();
@@ -71,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .user_agent("advanced-dashscope-client/1.0")
         .build()?;
 
-    let fully_custom_client = Client::builder()
+    let _fully_custom_client = Client::builder()
         .api_key(std::env::var("DASHSCOPE_API_KEY").unwrap_or_else(|_| "demo-key".to_string()))
         .http_client(advanced_http_client)
         .backoff(custom_backoff)
@@ -87,29 +84,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🔄 Example 5: Legacy API Compatibility");
 
     // Old way (still works)
-    let legacy_client = Client::new();
-    let legacy_with_key = legacy_client.with_api_key("legacy-key".to_string());
+    let _legacy_client = Client::new();
 
-    println!("✅ Legacy API still works for backward compatibility");
+    println!("✅ Legacy API (Client::new) still works for backward compatibility");
     println!();
 
     // Example 6: Configuration inspection
     println!("🔍 Example 6: Configuration Inspection");
 
-    let client = Client::builder().api_key("inspect-key").build();
+    let _client = Client::builder().api_key("inspect-key").build().unwrap();
 
     println!("Client configuration details:");
-    let headers = client.config().headers();
-    for (name, value) in headers.iter() {
-        if let Ok(value_str) = value.to_str() {
-            // Don't print the actual API key for security
-            if name == "authorization" {
-                println!("   {}: Bearer [REDACTED]", name);
-            } else {
-                println!("   {}: {}", name, value_str);
-            }
-        }
-    }
+    println!("   API key: [CONFIGURED]");
+    println!("   Base URL: Default DashScope endpoint");
+    println!("   HTTP client: Custom or default reqwest client");
     println!();
 
     // Example 7: Error handling demonstration
@@ -137,10 +125,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// (This would require a valid API key to run)
 #[allow(dead_code)]
 async fn demo_api_call() -> Result<(), Box<dyn std::error::Error>> {
-    let client = Client::builder()
+    let _client = Client::builder()
         .api_key(std::env::var("DASHSCOPE_API_KEY")?)
         .max_retry_duration(Duration::from_secs(120))
-        .build();
+        .build()?;
 
     // Example API call (commented out to avoid requiring valid credentials)
     /*

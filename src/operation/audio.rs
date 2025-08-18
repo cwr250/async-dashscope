@@ -145,7 +145,7 @@ mod tests {
         let json = serde_json::to_value(&request).unwrap();
 
         // stream field should not be present when None
-        assert!(!json.get("stream").is_some() || !json.get("stream").unwrap().is_null());
+        assert!(json.get("stream").is_none());
 
         // Required fields should be present
         assert!(json.get("model").is_some());

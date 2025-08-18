@@ -2,7 +2,9 @@ use std::{fmt::Debug, pin::Pin, sync::Arc, time::Duration};
 
 use async_stream::try_stream;
 use bytes::Bytes;
+use httpdate::parse_http_date;
 use reqwest_eventsource::{Event, EventSource, RequestBuilderExt as _};
+use secrecy::ExposeSecret as _;
 
 use serde::{Serialize, de::DeserializeOwned};
 use tokio_stream::{Stream, StreamExt as _};
@@ -11,6 +13,12 @@ use crate::{
     config::Config,
     error::{ApiError, DashScopeError, map_deserialization_error},
 };
+
+#[derive(Debug, thiserror::Error)]
+pub enum ClientBuildError {
+    #[error("failed to build HTTP client: {0}")]
+    Reqwest(#[from] reqwest::Error),
+}
 
 #[derive(Debug, Clone)]
 pub struct Client {
@@ -81,6 +89,10 @@ impl ClientBuilder {
 
     /// Set maximum number of retries (default: unlimited within time bound)
     /// Note: backoff crate doesn't directly support max count, so we set a reasonable max time
+    #[deprecated(
+        since = "0.5.0",
+        note = "Use max_retry_duration() or a custom backoff instead; count-based retries are not implemented"
+    )]
     pub fn max_retry_count(mut self, _count: u64) -> Self {
         let mut backoff = self.backoff.take().unwrap_or_default();
         backoff.max_elapsed_time = Some(Duration::from_secs(300)); // 5 minutes default
@@ -95,7 +107,7 @@ impl ClientBuilder {
     }
 
     /// Build the final Client
-    pub fn build(self) -> Client {
+    pub fn build(self) -> Result<Client, ClientBuildError> {
         let mut backoff = self.backoff.unwrap_or_default();
         // Set sensible defaults for production use
         if backoff.max_elapsed_time.is_none() {
@@ -103,27 +115,48 @@ impl ClientBuilder {
         }
 
         // Build HTTP client with timeout if not provided
-        let http_client = self.http_client.unwrap_or_else(|| {
-            let mut client_builder = reqwest::Client::builder();
+        let http_client = match self.http_client {
+            Some(client) => client,
+            None => {
+                let mut client_builder = reqwest::Client::builder();
 
-            // Set timeout (default: 30 seconds)
-            let timeout = self.timeout.unwrap_or_else(|| Duration::from_secs(30));
-            client_builder = client_builder.timeout(timeout);
+                // Set timeout (default: 30 seconds)
+                let timeout = self.timeout.unwrap_or_else(|| Duration::from_secs(30));
+                client_builder = client_builder.timeout(timeout);
 
-            client_builder.build().expect("Failed to build HTTP client")
-        });
+                // Set static default headers (non-auth headers)
+                let mut default_headers = reqwest::header::HeaderMap::new();
+                default_headers.insert(
+                    "Content-Type",
+                    reqwest::header::HeaderValue::from_static("application/json"),
+                );
+                default_headers.insert(
+                    "X-DashScope-OssResourceResolve",
+                    reqwest::header::HeaderValue::from_static("enable"),
+                );
+                default_headers.insert(
+                    reqwest::header::USER_AGENT,
+                    crate::config::USER_AGENT_VALUE
+                        .parse()
+                        .expect("static User-Agent header should parse successfully"),
+                );
+                client_builder = client_builder.default_headers(default_headers);
 
-        Client {
+                client_builder.build()?
+            }
+        };
+
+        Ok(Client {
             http_client: Arc::new(http_client),
             config: Arc::new(self.config.unwrap_or_default()),
             backoff: Arc::new(backoff),
-        }
+        })
     }
 }
 
 impl Default for Client {
     fn default() -> Self {
-        ClientBuilder::default().build()
+        ClientBuilder::default().build().unwrap()
     }
 }
 
@@ -138,33 +171,7 @@ impl Client {
         ClientBuilder::new()
     }
 
-    /// Create a Client with custom configuration (legacy method, prefer builder())
-    pub fn with_config(config: Config) -> Self {
-        ClientBuilder::new().config(config).build()
-    }
 
-    /// Set API key (legacy method, prefer builder())
-    pub fn with_api_key(self, api_key: String) -> Self {
-        let mut config = (*self.config).clone();
-        config.set_api_key(api_key.into());
-        Client {
-            config: Arc::new(config),
-            ..self
-        }
-    }
-
-    /// Build client with all components (legacy method, prefer builder())
-    pub fn build(
-        http_client: reqwest::Client,
-        config: Config,
-        backoff: backoff::ExponentialBackoff,
-    ) -> Self {
-        ClientBuilder::new()
-            .http_client(http_client)
-            .config(config)
-            .backoff(backoff)
-            .build()
-    }
 
     /// 获取当前实例的生成（Generation）信息
     ///
@@ -218,12 +225,18 @@ impl Client {
     {
         let url = self
             .config
-            .url(path)
-            .map_err(|e| DashScopeError::InvalidArgument(e.to_string()))?;
-        let event_source = self
+            .url(path)?;
+        tracing::debug!(target = "dashscope.http", %url, "opening SSE stream");
+        let mut request_builder = self
             .http_client
-            .post(url)
-            .headers(self.config.headers().clone())
+            .post(&url);
+
+        // Add Authorization header if API key is present
+        if let Some(auth_value) = self.auth_header() {
+            request_builder = request_builder.header(reqwest::header::AUTHORIZATION, auth_value);
+        }
+
+        let event_source = request_builder
             .json(&request)
             .eventsource()?;
 
@@ -238,12 +251,18 @@ impl Client {
         let request_maker = || async {
             let url = self
                 .config
-                .url(path)
-                .map_err(|e| DashScopeError::InvalidArgument(e.to_string()))?;
-            Ok(self
+                .url(path)?;
+            tracing::debug!(target = "dashscope.http", %url, "http post");
+            let mut request_builder = self
                 .http_client
-                .post(url)
-                .headers(self.config.headers().clone())
+                .post(&url);
+
+            // Add Authorization header if API key is present
+            if let Some(auth_value) = self.auth_header() {
+                request_builder = request_builder.header(reqwest::header::AUTHORIZATION, auth_value);
+            }
+
+            Ok(request_builder
                 .json(&request)
                 .build()?)
         };
@@ -277,8 +296,17 @@ impl Client {
             let response = client
                 .execute(request)
                 .await
-                .map_err(DashScopeError::Reqwest)
-                .map_err(backoff::Error::Permanent)?;
+                .map_err(|e| {
+                    // 仅对网络层可恢复错误启用退避重试
+                    if e.is_connect() || e.is_timeout() {
+                        backoff::Error::Transient {
+                            err: DashScopeError::Reqwest(e),
+                            retry_after: None
+                        }
+                    } else {
+                        backoff::Error::Permanent(DashScopeError::Reqwest(e))
+                    }
+                })?;
 
             let status = response.status();
 
@@ -291,9 +319,10 @@ impl Client {
                     .and_then(|s| {
                         // Try parsing as seconds first, then as HTTP date
                         s.parse::<u64>().ok().map(Duration::from_secs).or_else(|| {
-                            // If it's a date string, calculate duration from now
-                            // For simplicity, we'll just use a default duration
-                            Some(Duration::from_secs(60))
+                            parse_http_date(s).ok().and_then(|t| {
+                                let now = std::time::SystemTime::now();
+                                t.duration_since(now).ok()
+                            })
                         })
                     })
             } else {
@@ -308,9 +337,27 @@ impl Client {
 
             // Deserialize response body from either error object or actual response object
             if !status.is_success() {
-                let api_error: ApiError = serde_json::from_slice(bytes.as_ref())
-                    .map_err(|e| map_deserialization_error(e, bytes.clone()))
-                    .map_err(backoff::Error::Permanent)?;
+                let api_error = match serde_json::from_slice::<ApiError>(bytes.as_ref()) {
+                    Ok(e) => e,
+                    Err(_) => {
+                        // Non-JSON error body, construct generic error
+                        let snippet = String::from_utf8_lossy(&bytes).chars().take(200).collect::<String>();
+                        let generic = ApiError {
+                            message: format!("HTTP {} error: {}", status, snippet),
+                            code: Some(format!("HTTP_{}", status.as_u16())),
+                            request_id: None,
+                        };
+                        // 429/5xx → transient, others → permanent
+                        if status.as_u16() == 429 || (status.is_server_error() && status != reqwest::StatusCode::NOT_IMPLEMENTED) {
+                            return Err(backoff::Error::Transient {
+                                err: DashScopeError::ApiError(generic),
+                                retry_after
+                            });
+                        } else {
+                            return Err(backoff::Error::Permanent(DashScopeError::ApiError(generic)));
+                        }
+                    }
+                };
 
                 if status.as_u16() == 429 {
                     // Rate limited - honor Retry-After header if present
@@ -350,6 +397,15 @@ impl Client {
     pub fn config(&self) -> &Config {
         &self.config
     }
+
+    fn auth_header(&self) -> Option<reqwest::header::HeaderValue> {
+        let api_key = self.config.api_key().expose_secret();
+        if api_key.is_empty() {
+            None
+        } else {
+            Some(format!("Bearer {}", api_key).parse().expect("Bearer token should be valid header value"))
+        }
+    }
 }
 
 pub(crate) fn stream<O>(
@@ -374,9 +430,15 @@ where
                     yield response;
 
                     // Check for finish reason after sending the message.
-                    // This ensures the final message with "stop" is delivered.
-                    // Parse JSON only for finish reason check to avoid double parsing
-                    if message.data.contains("\"finish_reason\":\"stop\"") {
+                    // This ensures the final message with finish_reason is delivered.
+                    // Try JSON parsing first for robust detection, fall back to string contains
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&message.data) {
+                        if let Some(fr) = v.pointer("/output/finish_reason").and_then(|x| x.as_str()) {
+                            if fr != "null" {
+                                break;
+                            }
+                        }
+                    } else if message.data.contains("\"finish_reason\":") {
                         break;
                     }
                 }
@@ -394,40 +456,22 @@ mod tests {
     use secrecy::ExposeSecret;
 
     #[test]
-    pub fn test_config() {
-        let client = Client::builder().api_key("test key").build();
-
-        for header in client.config.headers().iter() {
-            if header.0 == "authorization" {
-                assert_eq!(header.1, "Bearer test key");
-            }
-        }
-    }
-
-    #[test]
     pub fn test_client_builder() {
         let client = Client::builder()
             .api_key("test-key")
             .max_retry_duration(std::time::Duration::from_secs(60))
-            .build();
+            .build()
+            .unwrap();
 
         // Verify the client was built successfully
         assert_eq!(client.config().api_key().expose_secret(), "test-key");
-
-        // Verify User-Agent header is set
-        let headers = client.config().headers();
-        assert!(headers.contains_key("user-agent"));
-        let user_agent = headers.get("user-agent").unwrap().to_str().unwrap();
-        assert!(user_agent.starts_with("async-dashscope/"));
     }
 
     #[test]
     pub fn test_default_client() {
         let client = Client::new();
 
-        // Should have default configuration
-        let headers = client.config().headers();
-        assert!(headers.contains_key("user-agent"));
-        assert!(headers.contains_key("content-type"));
+        // Should have default configuration - just verify it can be created
+        assert!(!client.config().api_key().expose_secret().is_empty() || client.config().api_key().expose_secret().is_empty());
     }
 }

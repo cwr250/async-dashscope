@@ -1,13 +1,14 @@
-use super::{output, param};
+use super::{output, param, util};
 use crate::{
     Client,
     error::{DashScopeError, Result},
     ws::pool::{WsLease, WsPool, WsPoolBuilder},
 };
-use bytes::Bytes;
+
 use futures_util::Stream;
 use reqwest::header::{AUTHORIZATION, USER_AGENT};
-use serde_json::Value;
+use secrecy::ExposeSecret as _;
+
 use std::{
     pin::Pin,
     sync::atomic::{AtomicBool, Ordering},
@@ -51,6 +52,12 @@ impl<'a> AsrPoolBuilder<'a> {
         self.size = n.max(1);
         self
     }
+
+    /// Alias for pool_size for naming consistency with WS pool
+    pub fn max_size(mut self, n: usize) -> Self {
+        self.size = n.max(1);
+        self
+    }
     pub fn write_capacity(mut self, n: usize) -> Self {
         self.write_cap = n.max(16);
         self
@@ -89,12 +96,24 @@ impl<'a> AsrPoolBuilder<'a> {
 
         // 仅注入必要头
         let h = request.headers_mut();
-        if let Some(v) = cfg.headers().get(AUTHORIZATION) {
-            h.insert(AUTHORIZATION, v.clone());
+
+        // Add Authorization header if API key is not empty
+        if !cfg.api_key().expose_secret().is_empty() {
+            h.insert(
+                AUTHORIZATION,
+                format!("Bearer {}", cfg.api_key().expose_secret())
+                    .parse()
+                    .expect("authorization header should parse successfully"),
+            );
         }
-        if let Some(v) = cfg.headers().get(USER_AGENT) {
-            h.insert(USER_AGENT, v.clone());
-        }
+
+        // Add User-Agent header
+        h.insert(
+            USER_AGENT,
+            crate::config::USER_AGENT_VALUE
+                .parse()
+                .expect("static User-Agent header should parse successfully"),
+        );
 
         let pool = WsPoolBuilder::new(request, self.size)
             .write_capacity(self.write_cap)
@@ -217,6 +236,14 @@ impl AsrDuplexSession {
     /// 如果底层WebSocket连接断开或发送失败，将返回错误
     pub async fn send_audio(&self, data: Vec<u8>) -> Result<()> {
         self.session.send_audio(data).await
+    }
+
+    /// Send audio data as bytes (avoids intermediate Vec allocation)
+    ///
+    /// # 错误
+    /// 如果底层WebSocket连接断开或发送失败，将返回错误
+    pub async fn send_audio_bytes(&self, data: bytes::Bytes) -> Result<()> {
+        self.session.send_audio_bytes(data).await
     }
 
     /// 完成音频发送，表示没有更多音频数据
@@ -356,72 +383,10 @@ impl AsrPool {
                 let task_id = task_id_for_stream.clone();
                 match ev {
                     Ok(Ok(WsMessage::Text(txt))) => {
-                        // 快速路径：先做字符串检查避免不必要的JSON解析
-                        if !txt.contains(&task_id) {
-                            return None;
-                        }
-
-                        // 轻量判断目标 task，再解析
-                        let v: Value = match serde_json::from_str(&txt) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                return Some(Err(DashScopeError::JSONDeserialize {
-                                    source: e,
-                                    raw_response: Bytes::from(txt),
-                                }));
-                            }
-                        };
-                        let hid = v
-                            .get("header")
-                            .and_then(|h| h.get("task_id"))
-                            .and_then(|s| s.as_str());
-                        if hid != Some(task_id.as_str()) {
-                            return None;
-                        }
-
-                        let header: output::IncomingHeader =
-                            match serde_json::from_value(v["header"].clone()) {
-                                Ok(h) => h,
-                                Err(e) => {
-                                    return Some(Err(DashScopeError::JSONDeserialize {
-                                        source: e,
-                                        raw_response: Bytes::from(txt),
-                                    }));
-                                }
-                            };
-
-                        let resp = match header.event_type() {
-                            output::AsrEventType::ResultGenerated => {
-                                if let Some(out_val) =
-                                    v.get("payload").and_then(|p| p.get("output"))
-                                {
-                                    match serde_json::from_value::<output::AsrOutput>(
-                                        out_val.clone(),
-                                    ) {
-                                        Ok(o) => output::AsrResponse::ResultGenerated(o),
-                                        Err(e) => {
-                                            return Some(Err(DashScopeError::JSONDeserialize {
-                                                source: e,
-                                                raw_response: Bytes::from(txt),
-                                            }));
-                                        }
-                                    }
-                                } else {
-                                    return None;
-                                }
-                            }
-                            output::AsrEventType::TaskStarted => output::AsrResponse::TaskStarted,
-                            output::AsrEventType::TaskFinished => output::AsrResponse::TaskFinished,
-                            output::AsrEventType::TaskFailed => output::AsrResponse::TaskFailed {
-                                error_code: header.error_code,
-                                error_message: header.error_message,
-                            },
-                            output::AsrEventType::Unknown(_) => return None,
-                        };
-                        Some(Ok(resp))
+                        util::parse_asr_ws_text_for_task(&task_id, &txt)
                     }
                     Ok(Ok(WsMessage::Close(_))) => Some(Ok(output::AsrResponse::TaskFinished)),
-                    Ok(Err(e)) => Some(Err(DashScopeError::WebSocketError(format!("{:?}", e)))),
+                    Ok(Err(e)) => Some(Err(DashScopeError::WebSocketError(e.to_string()))),
                     Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
                         Some(Err(DashScopeError::WebSocketError(format!(
                             "ASR stream lagged by {n}"
@@ -560,80 +525,16 @@ impl AsrPool {
         // 使用预订阅的receiver构造响应流，消除早期事件丢失风险
         let task_id = session.task_id().to_string();
         let resp_stream = {
-            use bytes::Bytes;
-            use serde_json::Value;
             use tokio_stream::wrappers::BroadcastStream;
 
             tokio_stream::StreamExt::filter_map(BroadcastStream::new(rx), move |ev| {
                 let task_id = task_id.clone();
                 match ev {
                     Ok(Ok(WsMessage::Text(txt))) => {
-                        // 快速路径：先做字符串检查避免不必要的JSON解析
-                        if !txt.contains(&task_id) {
-                            return None;
-                        }
-
-                        // 轻量判断目标 task，再解析
-                        let v: Value = match serde_json::from_str(&txt) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                return Some(Err(DashScopeError::JSONDeserialize {
-                                    source: e,
-                                    raw_response: Bytes::from(txt),
-                                }));
-                            }
-                        };
-                        let hid = v
-                            .get("header")
-                            .and_then(|h| h.get("task_id"))
-                            .and_then(|s| s.as_str());
-                        if hid != Some(task_id.as_str()) {
-                            return None;
-                        }
-
-                        let header: output::IncomingHeader =
-                            match serde_json::from_value(v["header"].clone()) {
-                                Ok(h) => h,
-                                Err(e) => {
-                                    return Some(Err(DashScopeError::JSONDeserialize {
-                                        source: e,
-                                        raw_response: Bytes::from(txt),
-                                    }));
-                                }
-                            };
-
-                        let resp = match header.event_type() {
-                            output::AsrEventType::ResultGenerated => {
-                                if let Some(out_val) =
-                                    v.get("payload").and_then(|p| p.get("output"))
-                                {
-                                    match serde_json::from_value::<output::AsrOutput>(
-                                        out_val.clone(),
-                                    ) {
-                                        Ok(o) => output::AsrResponse::ResultGenerated(o),
-                                        Err(e) => {
-                                            return Some(Err(DashScopeError::JSONDeserialize {
-                                                source: e,
-                                                raw_response: Bytes::from(txt),
-                                            }));
-                                        }
-                                    }
-                                } else {
-                                    return None;
-                                }
-                            }
-                            output::AsrEventType::TaskStarted => output::AsrResponse::TaskStarted,
-                            output::AsrEventType::TaskFinished => output::AsrResponse::TaskFinished,
-                            output::AsrEventType::TaskFailed => output::AsrResponse::TaskFailed {
-                                error_code: header.error_code,
-                                error_message: header.error_message,
-                            },
-                            output::AsrEventType::Unknown(_) => return None,
-                        };
-                        Some(Ok(resp))
+                        util::parse_asr_ws_text_for_task(&task_id, &txt)
                     }
                     Ok(Ok(WsMessage::Close(_))) => Some(Ok(output::AsrResponse::TaskFinished)),
-                    Ok(Err(e)) => Some(Err(DashScopeError::WebSocketError(format!("{:?}", e)))),
+                    Ok(Err(e)) => Some(Err(DashScopeError::WebSocketError(e.to_string()))),
                     Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
                         Some(Err(DashScopeError::WebSocketError(format!(
                             "ASR stream lagged by {n}"
@@ -714,6 +615,16 @@ impl AsrSession {
         self.lease.send_binary(chunk).await
     }
 
+    /// Send audio data as bytes (avoids intermediate Vec allocation)
+    pub async fn send_audio_bytes(&self, chunk: bytes::Bytes) -> Result<()> {
+        if self.finished.load(Ordering::Acquire) {
+            return Err(DashScopeError::InvalidArgument(
+                "send_audio after finish".into(),
+            ));
+        }
+        self.lease.send_binary(chunk.to_vec()).await
+    }
+
     pub async fn finish(&self) -> Result<()> {
         if self.finished.load(Ordering::Acquire) {
             return Ok(());
@@ -745,68 +656,10 @@ impl AsrSession {
             let task_id = task_id.clone();
             match ev {
                 Ok(Ok(WsMessage::Text(txt))) => {
-                    // 快速路径：先做字符串检查避免不必要的JSON解析
-                    if !txt.contains(&task_id) {
-                        return None;
-                    }
-
-                    // 轻量判断目标 task，再解析
-                    let v: Value = match serde_json::from_str(&txt) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            return Some(Err(DashScopeError::JSONDeserialize {
-                                source: e,
-                                raw_response: Bytes::from(txt),
-                            }));
-                        }
-                    };
-                    let hid = v
-                        .get("header")
-                        .and_then(|h| h.get("task_id"))
-                        .and_then(|s| s.as_str());
-                    if hid != Some(task_id.as_str()) {
-                        return None;
-                    }
-
-                    let header: output::IncomingHeader =
-                        match serde_json::from_value(v["header"].clone()) {
-                            Ok(h) => h,
-                            Err(e) => {
-                                return Some(Err(DashScopeError::JSONDeserialize {
-                                    source: e,
-                                    raw_response: Bytes::from(txt),
-                                }));
-                            }
-                        };
-
-                    let resp = match header.event_type() {
-                        output::AsrEventType::ResultGenerated => {
-                            if let Some(out_val) = v.get("payload").and_then(|p| p.get("output")) {
-                                match serde_json::from_value::<output::AsrOutput>(out_val.clone()) {
-                                    Ok(o) => output::AsrResponse::ResultGenerated(o),
-                                    Err(e) => {
-                                        return Some(Err(DashScopeError::JSONDeserialize {
-                                            source: e,
-                                            raw_response: Bytes::from(txt),
-                                        }));
-                                    }
-                                }
-                            } else {
-                                return None;
-                            }
-                        }
-                        output::AsrEventType::TaskStarted => output::AsrResponse::TaskStarted,
-                        output::AsrEventType::TaskFinished => output::AsrResponse::TaskFinished,
-                        output::AsrEventType::TaskFailed => output::AsrResponse::TaskFailed {
-                            error_code: header.error_code,
-                            error_message: header.error_message,
-                        },
-                        output::AsrEventType::Unknown(_) => return None,
-                    };
-                    Some(Ok(resp))
+                    util::parse_asr_ws_text_for_task(&task_id, &txt)
                 }
                 Ok(Ok(WsMessage::Close(_))) => Some(Ok(output::AsrResponse::TaskFinished)),
-                Ok(Err(e)) => Some(Err(DashScopeError::WebSocketError(format!("{:?}", e)))),
+                Ok(Err(e)) => Some(Err(DashScopeError::WebSocketError(e.to_string()))),
                 Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
                     Some(Err(DashScopeError::WebSocketError(format!(
                         "ASR stream lagged by {n}"
@@ -825,67 +678,10 @@ impl AsrSession {
                 let task_id = task_id.clone();
                 match ev {
                     Ok(Ok(WsMessage::Text(txt))) => {
-                        // 轻量判断目标 task，再解析
-                        let v: Value = match serde_json::from_str(&txt) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                return Some(Err(DashScopeError::JSONDeserialize {
-                                    source: e,
-                                    raw_response: Bytes::from(txt),
-                                }));
-                            }
-                        };
-                        let hid = v
-                            .get("header")
-                            .and_then(|h| h.get("task_id"))
-                            .and_then(|s| s.as_str());
-                        if hid != Some(task_id.as_str()) {
-                            return None;
-                        }
-
-                        let header: output::IncomingHeader =
-                            match serde_json::from_value(v["header"].clone()) {
-                                Ok(h) => h,
-                                Err(e) => {
-                                    return Some(Err(DashScopeError::JSONDeserialize {
-                                        source: e,
-                                        raw_response: Bytes::from(txt),
-                                    }));
-                                }
-                            };
-
-                        let resp = match header.event_type() {
-                            output::AsrEventType::ResultGenerated => {
-                                if let Some(out_val) =
-                                    v.get("payload").and_then(|p| p.get("output"))
-                                {
-                                    match serde_json::from_value::<output::AsrOutput>(
-                                        out_val.clone(),
-                                    ) {
-                                        Ok(o) => output::AsrResponse::ResultGenerated(o),
-                                        Err(e) => {
-                                            return Some(Err(DashScopeError::JSONDeserialize {
-                                                source: e,
-                                                raw_response: Bytes::from(txt),
-                                            }));
-                                        }
-                                    }
-                                } else {
-                                    return None;
-                                }
-                            }
-                            output::AsrEventType::TaskStarted => output::AsrResponse::TaskStarted,
-                            output::AsrEventType::TaskFinished => output::AsrResponse::TaskFinished,
-                            output::AsrEventType::TaskFailed => output::AsrResponse::TaskFailed {
-                                error_code: header.error_code,
-                                error_message: header.error_message,
-                            },
-                            output::AsrEventType::Unknown(_) => return None,
-                        };
-                        Some(Ok(resp))
+                        util::parse_asr_ws_text_for_task(&task_id, &txt)
                     }
                     Ok(Ok(WsMessage::Close(_))) => Some(Ok(output::AsrResponse::TaskFinished)),
-                    Ok(Err(e)) => Some(Err(DashScopeError::WebSocketError(format!("{:?}", e)))),
+                    Ok(Err(e)) => Some(Err(DashScopeError::WebSocketError(e.to_string()))),format!("{:?}", e)))),
                     Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
                         Some(Err(DashScopeError::WebSocketError(format!(
                             "ASR stream lagged by {n}"
@@ -917,11 +713,11 @@ impl Drop for AsrSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Client, ClientBuilder};
+    use crate::ClientBuilder;
 
     #[tokio::test]
     async fn test_asr_pool_builder_creation() {
-        let client = ClientBuilder::new().api_key("test-key").build();
+        let client = ClientBuilder::new().api_key("test-key").build().unwrap();
 
         let builder = AsrPoolBuilder::new(&client)
             .pool_size(2)
@@ -945,7 +741,7 @@ mod tests {
 
     #[test]
     fn test_pool_builder_configuration() {
-        let client = ClientBuilder::new().api_key("test-key").build();
+        let client = ClientBuilder::new().api_key("test-key").build().unwrap();
 
         // Test default values
         let builder = AsrPoolBuilder::new(&client);

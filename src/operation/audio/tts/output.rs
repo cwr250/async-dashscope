@@ -80,7 +80,11 @@ impl Audio {
             channels: num_channels,
             sample_rate,
             bits_per_sample,
-            sample_format: hound::SampleFormat::Int,
+            sample_format: if bits_per_sample == 8 {
+                hound::SampleFormat::Int // 8-bit uses unsigned int in WAV format
+            } else {
+                hound::SampleFormat::Int // 16-bit uses signed int
+            },
         };
 
         let mut writer = WavWriter::new(&mut buffer, spec).map_err(|e| {
@@ -98,9 +102,12 @@ impl Audio {
                 }
             }
             8 => {
-                // 直接写入u8样本
+                // WAV 8-bit PCM 使用无符号格式 (0-255)
+                // hound 库期望 8-bit 数据作为 u8 类型
                 for &sample in &pcm_data {
-                    writer.write_sample(sample as i8).map_err(|_| AudioOutputError::DataDecodeError)?;
+                    // Convert u8 to i8 for hound library (WAV 8-bit is unsigned but hound expects signed)
+                    let signed_sample = (sample as i16 - 128) as i8;
+                    writer.write_sample(signed_sample).map_err(|_| AudioOutputError::DataDecodeError)?;
                 }
             }
             _ => return Err(AudioOutputError::DataDecodeError),

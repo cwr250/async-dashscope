@@ -64,6 +64,12 @@ pub struct Parameters {
     #[builder(setter(into, strip_option))]
     #[builder(default=None)]
     pub response_format: Option<ResponseFormat>,
+
+    // Maximum number of tokens to generate
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(into, strip_option))]
+    #[builder(default=None)]
+    pub max_tokens: Option<usize>,
 }
 
 #[derive(Debug, Clone, Builder, Serialize, Deserialize, PartialEq)]

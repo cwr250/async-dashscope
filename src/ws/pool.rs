@@ -440,6 +440,36 @@ impl WsLease {
             .map_err(|_| DashScopeError::WebSocketError("writer task closed or full".into()))
     }
 
+    /// 发送文本消息 (接受字符串切片) - 推荐使用此接口
+    pub async fn send_text_str(&self, s: &str) -> Result<()> {
+        self.write_tx
+            .send(WsMessage::Text(s.to_owned().into()))
+            .await
+            .map_err(|_| DashScopeError::WebSocketError("writer task closed".into()))
+    }
+
+    /// 尝试发送文本消息 (接受字符串切片) - 推荐使用此接口
+    pub fn try_send_text_str(&self, s: &str) -> Result<()> {
+        self.write_tx
+            .try_send(WsMessage::Text(s.to_owned().into()))
+            .map_err(|_| DashScopeError::WebSocketError("writer task closed or full".into()))
+    }
+
+    /// 发送文本消息 (接受拥有的字符串)
+    pub async fn send_text_string(&self, s: String) -> Result<()> {
+        self.write_tx
+            .send(WsMessage::Text(s.into()))
+            .await
+            .map_err(|_| DashScopeError::WebSocketError("writer task closed".into()))
+    }
+
+    /// 尝试发送文本消息 (接受拥有的字符串)
+    pub fn try_send_text_string(&self, s: String) -> Result<()> {
+        self.write_tx
+            .try_send(WsMessage::Text(s.into()))
+            .map_err(|_| DashScopeError::WebSocketError("writer task closed or full".into()))
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<WsResult> {
         self.read_rx.resubscribe()
     }
@@ -595,26 +625,44 @@ async fn connection_actor(
                 }
             }
             Ok(Err(e)) => {
-                error!(
-                    "ws connection failed to {}: {}, retrying after {:?}...",
-                    request.uri(),
-                    e,
-                    backoff.next_backoff().unwrap_or(Duration::from_secs(1))
-                );
-                let _ = alive_tx.send(false);
-                let sleep = backoff.next_backoff().unwrap_or(Duration::from_secs(1));
-                tokio::time::sleep(sleep).await;
+                if let Some(sleep) = backoff.next_backoff() {
+                    error!(
+                        "ws connection failed to {}: {}, retrying after {:?}...",
+                        request.uri(),
+                        e,
+                        sleep
+                    );
+                    let _ = alive_tx.send(false);
+                    tokio::time::sleep(sleep).await;
+                } else {
+                    error!(
+                        "ws connection failed to {}: {}, max elapsed time exceeded, stopping retries",
+                        request.uri(),
+                        e
+                    );
+                    let _ = alive_tx.send(false);
+                    break;
+                }
             }
             Err(_) => {
-                error!(
-                    "ws connection timeout to {} after {:?}, retrying after {:?}...",
-                    request.uri(),
-                    connect_timeout,
-                    backoff.next_backoff().unwrap_or(Duration::from_secs(1))
-                );
-                let _ = alive_tx.send(false);
-                let sleep = backoff.next_backoff().unwrap_or(Duration::from_secs(1));
-                tokio::time::sleep(sleep).await;
+                if let Some(sleep) = backoff.next_backoff() {
+                    error!(
+                        "ws connection timeout to {} after {:?}, retrying after {:?}...",
+                        request.uri(),
+                        connect_timeout,
+                        sleep
+                    );
+                    let _ = alive_tx.send(false);
+                    tokio::time::sleep(sleep).await;
+                } else {
+                    error!(
+                        "ws connection timeout to {} after {:?}, max elapsed time exceeded, stopping retries",
+                        request.uri(),
+                        connect_timeout
+                    );
+                    let _ = alive_tx.send(false);
+                    break;
+                }
             }
         }
     }

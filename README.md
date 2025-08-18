@@ -47,6 +47,34 @@ export DASHSCOPE_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxx
 ```rust
 
 let client = Client::new().with_api_key(std::env::var("DASHSCOPE_API_KEY").unwrap());
+```
+
+#### 配置说明
+
+##### API Key 配置
+
+`ConfigBuilder` 允许空的 API key，与 `Config::default()` 行为保持一致。当 API key 为空时，Authorization 头将不会被添加到请求中：
+
+```rust
+// 允许空 API key
+let config = ConfigBuilder::default()
+    .api_key("")  // 空字符串是允许的
+    .build()
+    .unwrap();
+
+// 或者不设置 API key（将使用空字符串）
+let config = ConfigBuilder::default()
+    .build()
+    .unwrap();
+```
+
+##### 流式与非流式调用约束
+
+请注意，`call()` 和 `call_stream()` 方法有互斥约束：
+- 使用 `call()` 时，请求参数中的 `stream` 字段必须为 `false` 或未设置
+- 使用 `call_stream()` 时，请求参数中的 `stream` 字段将被自动设置为 `true`
+
+这种约束在编译时无法完全表达，因此在运行时会进行检查。
 
 ```
 

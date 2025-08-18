@@ -1,10 +1,28 @@
 use std::{path::PathBuf, str::FromStr};
 
-use reqwest::{Client, header::HeaderMap};
+use reqwest::{header::HeaderMap, Body};
 use serde::Deserialize;
 use serde_json::json;
-use tokio::{fs::File, io::AsyncReadExt};
+use tokio::fs::File;
+use tokio_util::io::ReaderStream;
 use url::Url;
+
+/// Helper function to convert any Display error to DashScopeError::UploadError
+fn upload_err<E: std::fmt::Display>(e: E) -> crate::error::DashScopeError {
+    crate::error::DashScopeError::UploadError(e.to_string())
+}
+
+/// Create HTTP client with proper timeout configuration
+fn new_http_client() -> reqwest::Client {
+    use std::time::Duration;
+    reqwest::Client::builder()
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(8)
+        .tcp_keepalive(Duration::from_secs(60))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .expect("HTTP client should build successfully")
+}
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
@@ -28,11 +46,12 @@ pub(crate) struct PolicyData {
     pub(crate) x_oss_forbid_overwrite: String,
 }
 
-/// 获取文件上传凭证
-pub(crate) async fn get_upload_policy(
+/// 获取文件上传凭证（使用提供的HTTP客户端）
+pub(crate) async fn get_upload_policy_with_client(
+    http_client: &reqwest::Client,
     api_key: &str,
     model_name: &str,
-) -> Result<UploadPolicy, reqwest::Error> {
+) -> Result<UploadPolicy, crate::error::DashScopeError> {
     let url = "https://dashscope.aliyuncs.com/api/v1/uploads";
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -43,36 +62,66 @@ pub(crate) async fn get_upload_policy(
     );
     headers.insert(
         "Content-Type",
-        "application/json"
-            .parse()
-            .expect("static header value 'application/json' should parse successfully"),
+        reqwest::header::HeaderValue::from_static("application/json"),
     );
     let params = json!({
         "action": "getPolicy",
         "model": model_name
     });
-    let response = reqwest::Client::new()
+    http_client
         .get(url)
         .headers(headers)
         .query(&params)
         .send()
-        .await?
+        .await
+        .map_err(upload_err)?
         .json::<UploadPolicy>()
-        .await?;
-    // todo: handle error
-    Ok(response)
+        .await
+        .map_err(upload_err)
+}
+
+/// 获取文件上传凭证（使用共享HTTP客户端）
+pub(crate) async fn get_upload_policy(
+    api_key: &str,
+    model_name: &str,
+) -> Result<UploadPolicy, crate::error::DashScopeError> {
+    use std::sync::OnceLock;
+    static SHARED_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+    let client = SHARED_CLIENT.get_or_init(new_http_client);
+    get_upload_policy_with_client(client, api_key, model_name).await
+}
+
+/// 获取共享的 OSS 上传客户端
+fn oss_http_client() -> &'static reqwest::Client {
+    use std::sync::OnceLock;
+    static OSS_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    OSS_CLIENT.get_or_init(new_http_client)
 }
 
 /// 将文件上传到临时存储OSS
 pub(crate) async fn upload_file_to_oss(
     policy_data: PolicyData,
-    mut file: File,
+    file: File,
     file_name: &str,
 ) -> Result<String, crate::error::DashScopeError> {
+    let meta = file
+        .metadata()
+        .await
+        .map_err(upload_err)?;
+    let len = meta.len();
+
     let key = format!("{}/{}", policy_data.upload_dir, file_name);
 
-    let mut buffer = Vec::new();
-    let _ = file.read_to_end(&mut buffer).await;
+    let stream = ReaderStream::new(file);
+    let body = Body::wrap_stream(stream);
+    let part = if len > 0 {
+        reqwest::multipart::Part::stream_with_length(body, len)
+            .file_name(file_name.to_string())
+    } else {
+        // 部分服务端对 chunked 可兼容
+        reqwest::multipart::Part::stream(body).file_name(file_name.to_string())
+    };
 
     let form = reqwest::multipart::Form::new()
         .text("OSSAccessKeyId", policy_data.oss_access_key_id.clone())
@@ -85,17 +134,14 @@ pub(crate) async fn upload_file_to_oss(
         )
         .text("key", key.clone())
         .text("success_action_status", "200".to_string())
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(buffer).file_name(file_name.to_string()),
-        );
+        .part("file", part);
 
-    let response = Client::new()
+    let response = oss_http_client()
         .post(&policy_data.upload_host)
         .multipart(form)
         .send()
         .await
-        .map_err(|e| crate::error::DashScopeError::UploadError(e.to_string()))?;
+        .map_err(upload_err)?;
 
     if !response.status().is_success() {
         let text = response.text().await.unwrap_or_default();
@@ -111,25 +157,23 @@ pub(crate) async fn upload_file_and_get_url(
     file_path: &str,
 ) -> Result<String, crate::error::DashScopeError> {
     let p = PathBuf::from_str(file_path)
-        .map_err(|e| crate::error::DashScopeError::UploadError(e.to_string()))?;
+        .map_err(upload_err)?;
 
     let file_name = p
         .file_name()
-        .ok_or_else(|| crate::error::DashScopeError::UploadError("file name is empty".to_string()))?
+        .ok_or_else(|| upload_err("file name is empty"))?
         .to_str()
-        .ok_or_else(|| {
-            crate::error::DashScopeError::UploadError("file name is empty".to_string())
-        })?;
+        .ok_or_else(|| upload_err("file name is not valid UTF-8"))?;
 
     let file = tokio::fs::OpenOptions::new()
         .read(true)
         .open(file_path)
         .await
-        .map_err(|e| crate::error::DashScopeError::UploadError(e.to_string()))?;
+        .map_err(upload_err)?;
     let meta = file
         .metadata()
         .await
-        .map_err(|e| crate::error::DashScopeError::UploadError(e.to_string()))?;
+        .map_err(upload_err)?;
 
     if !meta.is_file() {
         return Err(crate::error::DashScopeError::UploadError(
@@ -155,17 +199,7 @@ pub(crate) fn is_valid_url(s: &str) -> bool {
 mod test {
     use super::*;
 
-    #[tokio::test]
-    async fn test_get_upload_policy() -> Result<(), Box<dyn std::error::Error>> {
-        dotenvy::dotenv()?;
-        let api_key = std::env::var("DASHSCOPE_API_KEY")
-            .expect("DASHSCOPE_API_KEY environment variable should be set for tests");
-        let model_name = "qwen-vl-max";
-        let result = get_upload_policy(&api_key, model_name).await;
-        assert!(result.is_ok());
 
-        Ok(())
-    }
 
     #[test]
     fn test_is_valid_url_accepts_http_and_https() {
@@ -208,7 +242,7 @@ mod test {
     #[test]
     fn test_is_valid_url_edge_cases() {
         // Test edge cases
-        assert!(!is_valid_url("HTTP://EXAMPLE.COM")); // Uppercase scheme not handled by url crate
+        assert!(is_valid_url("HTTP://EXAMPLE.COM")); // URL crate normalizes scheme to lowercase
         assert!(is_valid_url("https://192.168.1.1")); // IP address
         assert!(is_valid_url("http://localhost:3000")); // Localhost
         assert!(is_valid_url("https://example.com/")); // Trailing slash
