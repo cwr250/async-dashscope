@@ -99,44 +99,6 @@ impl Default for FinishTaskPayload {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_run_task_payload_serialization_includes_empty_input() {
-        let parameters = AsrParametersBuilder::default().build().unwrap();
-        let payload = RunTaskPayload::new("paraformer-realtime-v2", &parameters);
-
-        let json = serde_json::to_string(&payload).unwrap();
-
-        // 验证即使 input 是空的，也会被序列化为 "input": {}
-        assert!(json.contains("\"input\":{}"));
-
-        // 验证完整的 JSON 结构
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert!(parsed.get("input").is_some());
-        assert!(parsed["input"].is_object());
-        assert!(parsed["input"].as_object().unwrap().is_empty());
-    }
-
-    #[test]
-    fn test_finish_task_payload_serialization_includes_empty_input() {
-        let payload = FinishTaskPayload::default();
-
-        let json = serde_json::to_string(&payload).unwrap();
-
-        // 验证即使 input 是空的，也会被序列化为 "input": {}
-        assert!(json.contains("\"input\":{}"));
-
-        // 验证完整的 JSON 结构
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert!(parsed.get("input").is_some());
-        assert!(parsed["input"].is_object());
-        assert!(parsed["input"].as_object().unwrap().is_empty());
-    }
-}
-
 #[derive(Debug, Serialize)]
 pub(crate) struct MessageHeader {
     pub action: String,

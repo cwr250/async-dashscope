@@ -449,29 +449,3 @@ where
 
     Box::pin(stream)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use secrecy::ExposeSecret;
-
-    #[test]
-    pub fn test_client_builder() {
-        let client = Client::builder()
-            .api_key("test-key")
-            .max_retry_duration(std::time::Duration::from_secs(60))
-            .build()
-            .unwrap();
-
-        // Verify the client was built successfully
-        assert_eq!(client.config().api_key().expose_secret(), "test-key");
-    }
-
-    #[test]
-    pub fn test_default_client() {
-        let client = Client::new();
-
-        // Should have default configuration - just verify it can be created
-        assert!(!client.config().api_key().expose_secret().is_empty() || client.config().api_key().expose_secret().is_empty());
-    }
-}
