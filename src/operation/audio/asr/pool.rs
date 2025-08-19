@@ -681,7 +681,7 @@ impl AsrSession {
                         util::parse_asr_ws_text_for_task(&task_id, &txt)
                     }
                     Ok(Ok(WsMessage::Close(_))) => Some(Ok(output::AsrResponse::TaskFinished)),
-                    Ok(Err(e)) => Some(Err(DashScopeError::WebSocketError(e.to_string()))),format!("{:?}", e)))),
+                    Ok(Err(e)) => Some(Err(DashScopeError::WebSocketError(e.to_string()))),
                     Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
                         Some(Err(DashScopeError::WebSocketError(format!(
                             "ASR stream lagged by {n}"

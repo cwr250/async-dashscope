@@ -42,6 +42,15 @@ impl From<tokio_tungstenite::tungstenite::Error> for WsError {
     }
 }
 
+impl std::fmt::Display for WsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WsError::WebSocket(msg) => write!(f, "WebSocket error: {}", msg),
+            WsError::ConnectionClosed => write!(f, "WebSocket connection closed"),
+        }
+    }
+}
+
 pub type WsResult = std::result::Result<WsMessage, WsError>;
 
 #[derive(Clone, Debug)]
