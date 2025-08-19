@@ -80,17 +80,6 @@ pub(crate) async fn get_upload_policy_with_client(
         .map_err(upload_err)
 }
 
-/// 获取文件上传凭证（使用共享HTTP客户端）
-pub(crate) async fn get_upload_policy(
-    api_key: &str,
-    model_name: &str,
-) -> Result<UploadPolicy, crate::error::DashScopeError> {
-    use std::sync::OnceLock;
-    static SHARED_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-
-    let client = SHARED_CLIENT.get_or_init(new_http_client);
-    get_upload_policy_with_client(client, api_key, model_name).await
-}
 
 /// 获取共享的 OSS 上传客户端
 fn oss_http_client() -> &'static reqwest::Client {
@@ -190,43 +179,6 @@ pub(crate) async fn upload_file_and_get_url_with_client(
     Ok(url)
 }
 
-/// 将文件上传到临时存储OSS（使用共享HTTP客户端）
-pub(crate) async fn upload_file_and_get_url(
-    api_key: &str,
-    model_name: &str,
-    file_path: &str,
-) -> Result<String, crate::error::DashScopeError> {
-    let p = PathBuf::from_str(file_path)
-        .map_err(upload_err)?;
-
-    let file_name = p
-        .file_name()
-        .ok_or_else(|| upload_err("file name is empty"))?
-        .to_str()
-        .ok_or_else(|| upload_err("file name is not valid UTF-8"))?;
-
-    let file = tokio::fs::OpenOptions::new()
-        .read(true)
-        .open(file_path)
-        .await
-        .map_err(upload_err)?;
-    let meta = file
-        .metadata()
-        .await
-        .map_err(upload_err)?;
-
-    if !meta.is_file() {
-        return Err(crate::error::DashScopeError::UploadError(
-            "file is not a file".into(),
-        ));
-    }
-
-    let policy_data = get_upload_policy(api_key, model_name).await?;
-
-    let url = upload_file_to_oss(policy_data.data, file, file_name).await?;
-
-    Ok(url)
-}
 
 /// 检查字符串是否为有效的URL (仅支持 http 和 https 协议)
 pub(crate) fn is_valid_url(s: &str) -> bool {
