@@ -25,6 +25,7 @@ pub struct MultiModalConversationParam {
 impl MultiModalConversationParam {
     pub(crate) async fn upload_file_to_oss(
         mut self,
+        http_client: &reqwest::Client,
         api_key: &str,
     ) -> Result<Self, crate::error::DashScopeError> {
         for message in self.input.messages.iter_mut() {
@@ -33,7 +34,7 @@ impl MultiModalConversationParam {
                     Element::Image(url) => {
                         if !is_valid_url(url) {
                             let oss_url =
-                                oss_util::upload_file_and_get_url(api_key, &self.model, url)
+                                oss_util::upload_file_and_get_url_with_client(http_client, api_key, &self.model, url)
                                     .await?;
                             *content = Element::Image(oss_url);
                         }
@@ -41,7 +42,7 @@ impl MultiModalConversationParam {
                     Element::Audio(url) => {
                         if !is_valid_url(url) {
                             let oss_url =
-                                oss_util::upload_file_and_get_url(api_key, &self.model, url)
+                                oss_util::upload_file_and_get_url_with_client(http_client, api_key, &self.model, url)
                                     .await?;
                             *content = Element::Audio(oss_url);
                         }
@@ -49,7 +50,7 @@ impl MultiModalConversationParam {
                     Element::Video(url) => {
                         if !is_valid_url(url) {
                             let oss_url =
-                                oss_util::upload_file_and_get_url(api_key, &self.model, url)
+                                oss_util::upload_file_and_get_url_with_client(http_client, api_key, &self.model, url)
                                     .await?;
                             *content = Element::Video(oss_url);
                         }

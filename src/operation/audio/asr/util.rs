@@ -1,7 +1,11 @@
 use bytes::Bytes;
 use serde_json::Value;
+use futures_util::Stream;
+use tokio_stream::{StreamExt, wrappers::BroadcastStream};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::error::DashScopeError;
+use crate::ws::pool::WsResult;
 use super::output;
 
 /// 集中封装 ASR WebSocket 文本解析逻辑，减少重复代码和维护成本
@@ -82,4 +86,34 @@ pub(crate) fn parse_asr_ws_text_for_task(
     };
 
     Some(Ok(resp))
+}
+
+/// 统一的 ASR 广播流映射函数，减少重复逻辑
+///
+/// # Arguments
+/// * `rx` - WebSocket 广播接收器
+/// * `task_id` - 任务ID
+///
+/// # Returns
+/// 过滤并解析后的 ASR 响应流
+pub(crate) fn subscribe_asr_stream_for_task(
+    rx: tokio::sync::broadcast::Receiver<WsResult>,
+    task_id: String,
+) -> impl Stream<Item = Result<output::AsrResponse, DashScopeError>> {
+    StreamExt::filter_map(BroadcastStream::new(rx), move |ev| {
+        let task_id = task_id.clone();
+        match ev {
+            Ok(Ok(WsMessage::Text(txt))) => {
+                parse_asr_ws_text_for_task(&task_id, &txt)
+            }
+            Ok(Ok(WsMessage::Close(_))) => Some(Ok(output::AsrResponse::TaskFinished)),
+            Ok(Err(e)) => Some(Err(DashScopeError::WebSocketError(e.to_string()))),
+            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                Some(Err(DashScopeError::WebSocketError(format!(
+                    "ASR stream lagged by {n}"
+                ))))
+            }
+            _ => None,
+        }
+    })
 }

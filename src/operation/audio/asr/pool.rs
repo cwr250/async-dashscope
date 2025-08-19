@@ -14,8 +14,8 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
-use tokio_stream::wrappers::BroadcastStream;
-use tokio_tungstenite::tungstenite::{Message as WsMessage, client::IntoClientRequest};
+
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -294,7 +294,7 @@ impl AsrPool {
 
         let bytes = serde_json::to_vec(&start_msg)
             .map_err(|e| DashScopeError::JSONSerialize(e.to_string()))?;
-        lease.send_text(bytes).await?;
+        lease.send_text_bytes(bytes).await?;
 
         Ok(AsrSession {
             task_id,
@@ -336,7 +336,7 @@ impl AsrPool {
 
         let bytes = serde_json::to_vec(&start_msg)
             .map_err(|e| DashScopeError::JSONSerialize(e.to_string()))?;
-        lease.send_text(bytes).await?;
+        lease.send_text_bytes(bytes).await?;
 
         Ok((
             AsrSession {
@@ -376,26 +376,7 @@ impl AsrPool {
 
         // 关键：使用预订阅的receiver构造响应流，消除早期事件丢失风险
         let task_id_for_stream = session_task_id.clone();
-        let mut resp_stream = {
-            use tokio_stream::wrappers::BroadcastStream;
-
-            tokio_stream::StreamExt::filter_map(BroadcastStream::new(rx), move |ev| {
-                let task_id = task_id_for_stream.clone();
-                match ev {
-                    Ok(Ok(WsMessage::Text(txt))) => {
-                        util::parse_asr_ws_text_for_task(&task_id, &txt)
-                    }
-                    Ok(Ok(WsMessage::Close(_))) => Some(Ok(output::AsrResponse::TaskFinished)),
-                    Ok(Err(e)) => Some(Err(DashScopeError::WebSocketError(e.to_string()))),
-                    Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-                        Some(Err(DashScopeError::WebSocketError(format!(
-                            "ASR stream lagged by {n}"
-                        ))))
-                    }
-                    _ => None,
-                }
-            })
-        };
+        let mut resp_stream = util::subscribe_asr_stream_for_task(rx, task_id_for_stream);
 
         // 并发接收任务
         let task_id_clone = session_task_id.clone();
@@ -524,26 +505,7 @@ impl AsrPool {
 
         // 使用预订阅的receiver构造响应流，消除早期事件丢失风险
         let task_id = session.task_id().to_string();
-        let resp_stream = {
-            use tokio_stream::wrappers::BroadcastStream;
-
-            tokio_stream::StreamExt::filter_map(BroadcastStream::new(rx), move |ev| {
-                let task_id = task_id.clone();
-                match ev {
-                    Ok(Ok(WsMessage::Text(txt))) => {
-                        util::parse_asr_ws_text_for_task(&task_id, &txt)
-                    }
-                    Ok(Ok(WsMessage::Close(_))) => Some(Ok(output::AsrResponse::TaskFinished)),
-                    Ok(Err(e)) => Some(Err(DashScopeError::WebSocketError(e.to_string()))),
-                    Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-                        Some(Err(DashScopeError::WebSocketError(format!(
-                            "ASR stream lagged by {n}"
-                        ))))
-                    }
-                    _ => None,
-                }
-            })
-        };
+        let resp_stream = util::subscribe_asr_stream_for_task(rx, task_id);
 
         // 转换 AsrResponse 到 AsrEvent，简化映射逻辑
         let event_stream = {
@@ -638,7 +600,7 @@ impl AsrSession {
         };
         let bytes =
             serde_json::to_vec(&msg).map_err(|e| DashScopeError::JSONSerialize(e.to_string()))?;
-        self.lease.send_text(bytes).await
+        self.lease.send_text_bytes(bytes).await
     }
 
     pub fn task_id(&self) -> &str {
@@ -652,45 +614,12 @@ impl AsrSession {
     pub fn stream_by_ref(&self) -> impl Stream<Item = Result<output::AsrResponse>> + use<> {
         let task_id = self.task_id.clone();
         let rx = self.lease.subscribe(); // 拿到一个新的广播接收端（独立于 self）
-        tokio_stream::StreamExt::filter_map(BroadcastStream::new(rx), move |ev| {
-            let task_id = task_id.clone();
-            match ev {
-                Ok(Ok(WsMessage::Text(txt))) => {
-                    util::parse_asr_ws_text_for_task(&task_id, &txt)
-                }
-                Ok(Ok(WsMessage::Close(_))) => Some(Ok(output::AsrResponse::TaskFinished)),
-                Ok(Err(e)) => Some(Err(DashScopeError::WebSocketError(e.to_string()))),
-                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-                    Some(Err(DashScopeError::WebSocketError(format!(
-                        "ASR stream lagged by {n}"
-                    ))))
-                }
-                _ => None,
-            }
-        })
+        util::subscribe_asr_stream_for_task(rx, task_id)
     }
 
     pub fn stream(self) -> impl Stream<Item = Result<output::AsrResponse>> {
         let task_id = self.task_id.clone();
-        tokio_stream::StreamExt::filter_map(
-            BroadcastStream::new(self.lease.subscribe()),
-            move |ev| {
-                let task_id = task_id.clone();
-                match ev {
-                    Ok(Ok(WsMessage::Text(txt))) => {
-                        util::parse_asr_ws_text_for_task(&task_id, &txt)
-                    }
-                    Ok(Ok(WsMessage::Close(_))) => Some(Ok(output::AsrResponse::TaskFinished)),
-                    Ok(Err(e)) => Some(Err(DashScopeError::WebSocketError(e.to_string()))),
-                    Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-                        Some(Err(DashScopeError::WebSocketError(format!(
-                            "ASR stream lagged by {n}"
-                        ))))
-                    }
-                    _ => None,
-                }
-            },
-        )
+        util::subscribe_asr_stream_for_task(self.lease.subscribe(), task_id)
     }
 }
 
@@ -704,7 +633,7 @@ impl Drop for AsrSession {
                 payload: param::FinishTaskPayload::default(),
             };
             if let Ok(bytes) = serde_json::to_vec(&msg) {
-                let _ = self.lease.try_send_text(bytes);
+                let _ = self.lease.try_send_text_bytes(bytes);
             }
         }
     }

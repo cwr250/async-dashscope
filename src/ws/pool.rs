@@ -18,7 +18,9 @@ use tracing::{error, info};
 
 static CONNECTION_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-/// Pool status for observability
+// Error message constants for consistent handling
+const POOL_EXHAUSTED_ERROR: &str = "Connection pool exhausted";
+
 #[derive(Debug, Clone)]
 pub struct PoolStatus {
     pub total: usize,
@@ -329,7 +331,7 @@ impl WsPool {
                 }
 
                 return Err(DashScopeError::WebSocketError(
-                    "Connection pool exhausted".into(),
+                    POOL_EXHAUSTED_ERROR.into(),
                 ));
             }
         }
@@ -360,7 +362,7 @@ impl WsPool {
                 // Drop the connection (will terminate actor) and return error
                 drop(conn);
                 return Err(DashScopeError::WebSocketError(
-                    "Connection pool exhausted".into(),
+                    POOL_EXHAUSTED_ERROR.into(),
                 ));
             }
 
@@ -391,7 +393,7 @@ impl WsPool {
                     if tokio::time::Instant::now() < deadline {
                         // Check if this is a "pool exhausted" error worth retrying
                         if let DashScopeError::WebSocketError(msg) = &e {
-                            if msg.contains("Connection pool exhausted") {
+                            if msg.contains(POOL_EXHAUSTED_ERROR) {
                                 tracing::debug!("Pool exhausted, retrying in 20ms...");
                                 tokio::time::sleep(Duration::from_millis(20)).await;
                                 continue;
@@ -427,14 +429,22 @@ pub struct WsLease {
 }
 
 impl WsLease {
-    pub async fn send_text(&self, text_utf8: Vec<u8>) -> Result<()> {
-        let s = String::from_utf8(text_utf8).map_err(DashScopeError::InvalidUtf8)?;
+    /// 发送文本消息 (接受字符串切片) - 主要接口
+    pub async fn send_text(&self, s: &str) -> Result<()> {
         self.write_tx
-            .send(WsMessage::Text(s.into()))
+            .send(WsMessage::Text(s.to_owned().into()))
             .await
             .map_err(|_| DashScopeError::WebSocketError("writer task closed".into()))
     }
 
+    /// 尝试发送文本消息 (接受字符串切片) - 主要接口
+    pub fn try_send_text(&self, s: &str) -> Result<()> {
+        self.write_tx
+            .try_send(WsMessage::Text(s.to_owned().into()))
+            .map_err(|_| DashScopeError::WebSocketError("writer task closed or full".into()))
+    }
+
+    /// 发送二进制消息
     pub async fn send_binary(&self, data: Vec<u8>) -> Result<()> {
         self.write_tx
             .send(WsMessage::Binary(data.into()))
@@ -442,41 +452,23 @@ impl WsLease {
             .map_err(|_| DashScopeError::WebSocketError("writer task closed".into()))
     }
 
-    pub fn try_send_text(&self, text_utf8: Vec<u8>) -> Result<()> {
+    /// 尝试发送二进制消息
+    pub fn try_send_binary(&self, data: Vec<u8>) -> Result<()> {
+        self.write_tx
+            .try_send(WsMessage::Binary(data.into()))
+            .map_err(|_| DashScopeError::WebSocketError("writer task closed or full".into()))
+    }
+
+    /// 发送文本消息 (从 UTF-8 字节向量) - 兼容接口
+    pub async fn send_text_bytes(&self, text_utf8: Vec<u8>) -> Result<()> {
         let s = String::from_utf8(text_utf8).map_err(DashScopeError::InvalidUtf8)?;
-        self.write_tx
-            .try_send(WsMessage::Text(s.into()))
-            .map_err(|_| DashScopeError::WebSocketError("writer task closed or full".into()))
+        self.send_text(&s).await
     }
 
-    /// 发送文本消息 (接受字符串切片) - 推荐使用此接口
-    pub async fn send_text_str(&self, s: &str) -> Result<()> {
-        self.write_tx
-            .send(WsMessage::Text(s.to_owned().into()))
-            .await
-            .map_err(|_| DashScopeError::WebSocketError("writer task closed".into()))
-    }
-
-    /// 尝试发送文本消息 (接受字符串切片) - 推荐使用此接口
-    pub fn try_send_text_str(&self, s: &str) -> Result<()> {
-        self.write_tx
-            .try_send(WsMessage::Text(s.to_owned().into()))
-            .map_err(|_| DashScopeError::WebSocketError("writer task closed or full".into()))
-    }
-
-    /// 发送文本消息 (接受拥有的字符串)
-    pub async fn send_text_string(&self, s: String) -> Result<()> {
-        self.write_tx
-            .send(WsMessage::Text(s.into()))
-            .await
-            .map_err(|_| DashScopeError::WebSocketError("writer task closed".into()))
-    }
-
-    /// 尝试发送文本消息 (接受拥有的字符串)
-    pub fn try_send_text_string(&self, s: String) -> Result<()> {
-        self.write_tx
-            .try_send(WsMessage::Text(s.into()))
-            .map_err(|_| DashScopeError::WebSocketError("writer task closed or full".into()))
+    /// 尝试发送文本消息 (从 UTF-8 字节向量) - 兼容接口
+    pub fn try_send_text_bytes(&self, text_utf8: Vec<u8>) -> Result<()> {
+        let s = String::from_utf8(text_utf8).map_err(DashScopeError::InvalidUtf8)?;
+        self.try_send_text(&s)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<WsResult> {

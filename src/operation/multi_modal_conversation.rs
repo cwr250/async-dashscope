@@ -47,7 +47,7 @@ impl<'a> MultiModalConversation<'a> {
         validator.validate(&request)?;
 
         let request = request
-            .upload_file_to_oss(self.client.config().api_key().expose_secret())
+            .upload_file_to_oss(self.client.http_client(), self.client.config().api_key().expose_secret())
             .await?;
 
         // 发起非流式多模态对话请求。

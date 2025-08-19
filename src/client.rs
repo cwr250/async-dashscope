@@ -225,11 +225,11 @@ impl Client {
     {
         let url = self
             .config
-            .url(path)?;
+            .url_url(path)?;
         tracing::debug!(target = "dashscope.http", %url, "opening SSE stream");
         let mut request_builder = self
             .http_client
-            .post(&url);
+            .post(url);
 
         // Add Authorization header if API key is present
         if let Some(auth_value) = self.auth_header() {
@@ -251,11 +251,11 @@ impl Client {
         let request_maker = || async {
             let url = self
                 .config
-                .url(path)?;
+                .url_url(path)?;
             tracing::debug!(target = "dashscope.http", %url, "http post");
             let mut request_builder = self
                 .http_client
-                .post(&url);
+                .post(url);
 
             // Add Authorization header if API key is present
             if let Some(auth_value) = self.auth_header() {
@@ -398,6 +398,11 @@ impl Client {
         &self.config
     }
 
+    /// Get a reference to the internal HTTP client for advanced use cases
+    pub fn http_client(&self) -> &reqwest::Client {
+        &self.http_client
+    }
+
     fn auth_header(&self) -> Option<reqwest::header::HeaderValue> {
         let api_key = self.config.api_key().expose_secret();
         if api_key.is_empty() {
@@ -406,6 +411,23 @@ impl Client {
             Some(format!("Bearer {}", api_key).parse().expect("Bearer token should be valid header value"))
         }
     }
+}
+
+/// 检查 SSE 消息是否表示流结束
+fn sse_finished(data: &str) -> bool {
+    // 优先 JSON 判定
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+        // text 模式: /output/finish_reason
+        if let Some(fr) = v.get("output").and_then(|o| o.get("finish_reason")).and_then(|x| x.as_str()) {
+            return matches!(fr, "stop" | "length" | "tool_calls");
+        }
+        // message 模式: /output/choices/0/finish_reason
+        if let Some(fr) = v.pointer("/output/choices/0/finish_reason").and_then(|x| x.as_str()) {
+            return matches!(fr, "stop" | "length" | "tool_calls");
+        }
+    }
+    // 不做基于子串的激进 break；仅在明确检测到 finish 时结束
+    false
 }
 
 pub(crate) fn stream<O>(
@@ -426,19 +448,11 @@ where
                     let response: O = serde_json::from_str(&message.data)
                         .map_err(|e| map_deserialization_error(e, Bytes::from(message.data.clone())))?;
 
-                    // Yield the successful message
+                    // 先 yield 确保最后一条也能送达
                     yield response;
 
-                    // Check for finish reason after sending the message.
-                    // This ensures the final message with finish_reason is delivered.
-                    // Try JSON parsing first for robust detection, fall back to string contains
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&message.data) {
-                        if let Some(fr) = v.pointer("/output/finish_reason").and_then(|x| x.as_str()) {
-                            if fr != "null" {
-                                break;
-                            }
-                        }
-                    } else if message.data.contains("\"finish_reason\":") {
+                    // 使用健壮的终止检测
+                    if sse_finished(&message.data) {
                         break;
                     }
                 }

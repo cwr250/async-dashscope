@@ -99,18 +99,23 @@ impl ConfigBuilder {
 }
 
 impl Config {
-    pub fn url(&self, path: &str) -> Result<String, ConfigError> {
+    /// Get URL as Url type for internal use (avoids re-parsing)
+    pub fn url_url(&self, path: &str) -> Result<Url, ConfigError> {
         // Handle empty path case
         if path.is_empty() {
-            let base_str = self.api_base.as_str();
-            return Ok(base_str.trim_end_matches('/').to_owned());
+            return Ok(self.api_base.clone());
         }
 
         // Clean the path and join using url crate for robust handling
         let path = path.trim_start_matches('/');
         let joined_url = self.api_base.join(path)?;
 
-        Ok(joined_url.to_string())
+        Ok(joined_url)
+    }
+
+    /// Get URL as String for backward compatibility
+    pub fn url(&self, path: &str) -> Result<String, ConfigError> {
+        Ok(self.url_url(path)?.to_string())
     }
     pub fn set_api_key(&mut self, api_key: SecretString) {
         self.api_key = api_key;
